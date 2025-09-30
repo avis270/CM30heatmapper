@@ -1,4 +1,4 @@
-import io, os, tempfile, re
+import io, os, re
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -41,12 +41,12 @@ def parse_cm30_file(uploaded_file):
 
     plate_type = detect_plate_type(raw)
 
-    # Find result section
+    # Find results section
     m = re.search(r"<(Colony Forming Result|Single Result)>", raw)
     if not m:
         raise ValueError("Could not find results section")
 
-    # Extract lines after that section
+    # Extract lines after section
     section = raw[m.end():].strip().splitlines()
     rows = []
     current_well = None
@@ -55,23 +55,28 @@ def parse_cm30_file(uploaded_file):
         if not line.strip():
             continue
         if line.startswith("Well"):
-            current_well = line.strip()
+            current_well = line.strip().split(",")[0].split("\t")[0]
             continue
-        parts = line.split("\t")
+        # try commas first, then tabs
+        if "," in line:
+            parts = line.split(",")
+        else:
+            parts = line.split("\t")
+
         if len(parts) < 4:
             continue
         passage, time, confl, count = parts[:4]
         rows.append({
             "Well": current_well,
-            "Passage": passage,
-            "Time": time,
+            "Passage": passage.strip(),
+            "Time": time.strip(),
             "Confluency": pd.to_numeric(confl, errors="coerce"),
             "Count": pd.to_numeric(count, errors="coerce")
         })
 
     df = pd.DataFrame(rows)
     if df.empty:
-        raise ValueError("Parsed no data rows")
+        raise ValueError("Parsed no data rows (check delimiter/section headers)")
 
     return plate_type, df
 
@@ -108,7 +113,7 @@ def plot_heatmap(plate_type, df, cmap_min="#0000ff", cmap_max="#ff0000"):
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-st.title("CM30 Heatmapper (Iteration 1, Fixed Parser)")
+st.title("CM30 Heatmapper (Iteration 1, CSV-aware)")
 
 uploaded_file = st.file_uploader("Upload CM30 CSV file", type=["csv"])
 cmap_min = st.color_picker("Low value color", "#0000ff")
@@ -122,6 +127,5 @@ if uploaded_file:
         st.pyplot(fig)
     except Exception as e:
         st.error(str(e))
-        st.text("Preview of first 30 lines:")
         uploaded_file.seek(0)
         st.text(uploaded_file.read(2000).decode("utf-8", errors="ignore"))
