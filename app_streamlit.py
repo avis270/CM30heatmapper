@@ -174,13 +174,12 @@ st.markdown(
     """
     **Step 1:** Export and download your analysis .csv from the CM30  
     **Step 2:** Extract the files  
-    **Step 3:** Upload the file that contains the averages per well.  
-    The filename will contain **EV**
+    **Step 3:** Upload the file that contains the averages per well.  The filename will contain EV
     """,
     unsafe_allow_html=True
 )
 
-uploaded_file = st.file_uploader("Upload CM30 CSV", type=["csv"])
+uploaded_file = st.file_uploader("", type=["csv"], label_visibility="collapsed")
 
 
 if uploaded_file:
@@ -260,6 +259,7 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
 
 
 
