@@ -83,4 +83,55 @@ def generate_plate_layout(plate_type, data_df):
     return merged, rows, cols
 
 
-def plot_plate_
+def plot_plate_heatmap(plate_df, rows, cols, vmin=0, vmax=100):
+    """Render heatmap of plate data with missing wells in black."""
+    fig, ax = plt.subplots(figsize=(cols, len(rows)))
+    ax.set_xlim(0, cols)
+    ax.set_ylim(0, len(rows))
+    ax.axis("off")
+
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    cmap = plt.cm.viridis
+
+    for i, row in enumerate(rows):
+        for j in range(1, cols+1):
+            well = f"{row}{j}"
+            val = plate_df.loc[plate_df["Well"] == well, "Confluency"].values
+            color = "black"
+            if len(val) > 0 and pd.notna(val[0]):
+                color = cmap(norm(val[0]))
+            rect = patches.Rectangle((j-1, len(rows)-i-1), 1, 1,
+                                     facecolor=color, edgecolor="white")
+            ax.add_patch(rect)
+            ax.text(j-0.5, len(rows)-i-0.5, well,
+                    ha="center", va="center", color="white", fontsize=8)
+
+    return fig
+
+
+# ---------------- Streamlit UI ----------------
+st.title("CM30 Heatmap Viewer")
+
+uploaded_file = st.file_uploader("Upload a CM30 CSV file", type=["csv"])
+if uploaded_file:
+    try:
+        df, plate_type = parse_cm30_file(uploaded_file)
+        st.success(f"Detected plate type: {plate_type}")
+
+        plate_df, rows, cols = generate_plate_layout(plate_type, df)
+
+        vmin = st.number_input("Minimum value (color scale)", 0.0, 100.0, 0.0)
+        vmax = st.number_input("Maximum value (color scale)", 0.0, 100.0, 100.0)
+
+        fig = plot_plate_heatmap(plate_df, rows, cols, vmin, vmax)
+        st.pyplot(fig)
+
+        # Download option
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150)
+        st.download_button("Download heatmap as PNG",
+                           data=buf.getvalue(),
+                           file_name=f"heatmap_{plate_type}.png",
+                           mime="image/png")
+    except Exception as e:
+        st.error(f"Could not parse file: {e}")
