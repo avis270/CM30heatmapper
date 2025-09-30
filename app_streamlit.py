@@ -172,7 +172,7 @@ st.title("📊 CM30 Well Plate Heatmap")
 
 st.markdown(
     """
-    **Step 1:** Export and download your analysis `.csv` from the CM30  
+    **Step 1:** Export and download your analysis .csv from the CM30  
     **Step 2:** Extract the files  
     **Step 3:** Upload the file that contains the averages per well.  
     The filename will contain **EV**
@@ -260,5 +260,6 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
 
 
