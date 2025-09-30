@@ -170,7 +170,10 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
 # -------------------------
 st.title("📊 CM30 Well Plate Heatmap")
 
-uploaded_file = st.file_uploader("Upload CM30 CSV", type=["csv"])
+uploaded_file = st.file_uploader("
+Step 1: Export and download your analysis .csv from the CM30 <br> 
+Step 2: Extract the files <br> 
+Step 3: Upload the file that contains the averages per well.  The filename will contain EV ", type=["csv"])
 
 if uploaded_file:
     try:
@@ -249,3 +252,4 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
