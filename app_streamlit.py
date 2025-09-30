@@ -41,10 +41,11 @@ def parse_file(uploaded_file):
 
     plate_type = detect_plate_type(lines)
     if not plate_type:
-        raise ValueError(f"Unsupported or undetected plate type in file.")
+        raise ValueError("Unsupported or undetected plate type in file.")
 
     # Parse <Single Result> or <Colony Forming Result>
     data = {}
+    times = []
     current_well = None
     in_results = False
     for line in lines:
@@ -57,24 +58,27 @@ def parse_file(uploaded_file):
 
         if line.startswith("Well"):
             current_well = line.split()[0]
-            data[current_well] = None
+            data[current_well] = []
             continue
 
         if current_well and not line.startswith("Passage#"):
             parts = line.split(",")
             if len(parts) >= 4:
                 try:
+                    t = parts[1].strip()
                     conf = float(parts[2])
-                    data[current_well] = conf  # take first confluency value
+                    data[current_well].append((t, conf))
+                    if t not in times:
+                        times.append(t)
                 except ValueError:
                     pass
 
-    return plate_type, data
+    return plate_type, data, times
 
 # ------------------------
 # Heatmap rendering
 # ------------------------
-def render_heatmap(plate_type, data, cmap="viridis", vmin=0, vmax=100):
+def render_heatmap(plate_type, data, timepoint, cmap="viridis", vmin=0, vmax=100):
     rows, cols = PLATE_LAYOUTS[plate_type]
     fig, ax = plt.subplots(figsize=(len(cols), len(rows)))
 
@@ -84,11 +88,20 @@ def render_heatmap(plate_type, data, cmap="viridis", vmin=0, vmax=100):
     for i, row in enumerate(rows):
         for j, col in enumerate(cols):
             well_id = f"Well{row}{col}"
-            val = data.get(well_id)
+            val = None
+            if well_id in data:
+                # find closest match to selected timepoint
+                for t, conf in data[well_id]:
+                    if t == timepoint:
+                        val = conf
+                        break
             color = cmap(norm(val)) if val is not None else "black"
             rect = patches.Rectangle((j, i), 1, 1, facecolor=color, edgecolor="white")
             ax.add_patch(rect)
-            ax.text(j + 0.5, i + 0.5, f"{row}{col}", ha="center", va="center", color="white", fontsize=8)
+
+            # Label with confluency % or "NA"
+            label = f"{val:.1f}" if val is not None else "NA"
+            ax.text(j + 0.5, i + 0.5, label, ha="center", va="center", color="white", fontsize=8)
 
     ax.set_xlim(0, len(cols))
     ax.set_ylim(0, len(rows))
@@ -105,20 +118,28 @@ st.title("Well Plate Heatmap Viewer")
 uploaded_file = st.file_uploader("Upload a plate CSV", type=["csv", "txt"])
 if uploaded_file:
     try:
-        plate_type, data = parse_file(uploaded_file)
+        plate_type, data, times = parse_file(uploaded_file)
         st.success(f"Detected plate type: {plate_type}")
+
+        # Timepoint slider
+        if times:
+            idx = st.slider("Select timepoint index", 0, len(times)-1, 0)
+            timepoint = times[idx]
+            st.write(f"Selected time: **{timepoint}**")
+        else:
+            timepoint = None
 
         vmin = st.number_input("Minimum value (color scale)", value=0)
         vmax = st.number_input("Maximum value (color scale)", value=100)
         cmap = st.selectbox("Color map", ["viridis", "plasma", "inferno", "magma", "cividis"])
 
-        fig = render_heatmap(plate_type, data, cmap=cmap, vmin=vmin, vmax=vmax)
-        st.pyplot(fig)
+        if timepoint:
+            fig = render_heatmap(plate_type, data, timepoint, cmap=cmap, vmin=vmin, vmax=vmax)
+            st.pyplot(fig)
 
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png")
-        st.download_button("Download Heatmap", buf.getvalue(), file_name="heatmap.png", mime="image/png")
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png")
+            st.download_button("Download Heatmap", buf.getvalue(), file_name="heatmap.png", mime="image/png")
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
-
