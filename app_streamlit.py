@@ -12,10 +12,20 @@ from datetime import datetime
 # Plate layouts definition
 # ------------------------
 PLATE_LAYOUTS = {
-    "6well":   (["A", "B"], list(range(1, 4))),
-    "12well":  (["A", "B", "C"], list(range(1, 5))),
-    "24well":  (["A", "B", "C", "D"], list(range(1, 7))),
-    "96well":  (list("ABCDEFGH"), list(range(1, 13))),
+    "6well":   (["A", "B"], list(range(1, 4))),   # 2x3
+    "12well":  (["A", "B", "C"], list(range(1, 5))),  # 3x4
+    "24well":  (["A", "B", "C", "D"], list(range(1, 7))),  # 4x6
+    "96well":  (list("ABCDEFGH"), list(range(1, 13))),  # 8x12
+}
+
+# For 6well, map Well1..Well6 to plate positions
+SIX_WELL_MAP = {
+    "Well1": "WellA1",
+    "Well2": "WellA2",
+    "Well3": "WellA3",
+    "Well4": "WellB1",
+    "Well5": "WellB2",
+    "Well6": "WellB3",
 }
 
 # ------------------------
@@ -26,7 +36,7 @@ def detect_plate_type(lines):
     for line in lines:
         lower = line.lower()
         if "well" in lower:
-            tokens = re.split(r"[\t, ]", line.strip())
+            tokens = re.split(r"[\t, ,]", line.strip())
             for t in tokens:
                 t_clean = t.strip().lower()
                 if t_clean in PLATE_LAYOUTS:
@@ -59,30 +69,32 @@ def parse_file(uploaded_file):
 
         if line.startswith("Well"):
             current_well = line.split()[0]
+            # Normalize Well1..Well6 to A/B layout
+            if plate_type == "6well" and current_well in SIX_WELL_MAP:
+                current_well = SIX_WELL_MAP[current_well]
             data[current_well] = []
             continue
 
         if current_well and not line.startswith("Passage#"):
-            parts = line.split(",")
+            parts = re.split(r"[\t,]", line)
             if len(parts) >= 4:
                 try:
                     t_raw = parts[1].strip()
                     conf = float(parts[2])
                     # Normalize timestamp
-                    try:
-                        t = datetime.strptime(t_raw, "%Y/%m/%d %H:%M")
-                    except:
+                    t = None
+                    for fmt in ["%Y/%m/%d %H:%M", "%m/%d/%Y %H:%M", "%m/%d/%Y %H:%M:%S"]:
                         try:
-                            t = datetime.strptime(t_raw, "%m/%d/%Y %H:%M")
+                            t = datetime.strptime(t_raw, fmt)
+                            break
                         except:
-                            t = None
+                            continue
                     if t:
                         data[current_well].append((t, conf))
                         times.add(t)
                 except ValueError:
                     pass
 
-    # Sort times
     times = sorted(list(times))
     return plate_type, data, times
 
@@ -101,7 +113,6 @@ def render_heatmap(plate_type, data, timepoint, cmap="viridis", vmin=0, vmax=100
             well_id = f"Well{row}{col}"
             val = None
             if well_id in data:
-                # get confluency closest in time
                 vals = [(abs((t - timepoint).total_seconds()), conf) for t, conf in data[well_id]]
                 if vals:
                     _, val = min(vals, key=lambda x: x[0])
@@ -109,7 +120,6 @@ def render_heatmap(plate_type, data, timepoint, cmap="viridis", vmin=0, vmax=100
             rect = patches.Rectangle((j, i), 1, 1, facecolor=color, edgecolor="white")
             ax.add_patch(rect)
 
-            # Label with confluency % or "NA"
             label = f"{val:.1f}" if val is not None else "NA"
             ax.text(j + 0.5, i + 0.5, label, ha="center", va="center", color="white", fontsize=8)
 
