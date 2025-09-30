@@ -1,4 +1,8 @@
-import io, os, tempfile, zipfile
+import io
+import os
+import tempfile
+import zipfile
+import re
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  # safe for packaging/headless
@@ -7,131 +11,124 @@ import matplotlib.patches as patches
 import matplotlib.colors as mcolors
 import streamlit as st
 
-# Plate layouts: row letters × column counts
+# Plate layouts for supported types
 PLATE_LAYOUTS = {
-    "6well":   (["A", "B"], 3),
-    "12well":  (["A", "B", "C"], 4),
-    "24well":  (["A", "B", "C", "D"], 6),
-    "96well":  (list("ABCDEFGH"), 12),
+    "6well":   (["A", "B"], list(range(1, 4))),
+    "12well":  (["A", "B", "C"], list(range(1, 5))),
+    "24well":  (["A", "B", "C", "D"], list(range(1, 7))),
+    "96well":  (list("ABCDEFGH"), list(range(1, 13))),
 }
 
-def parse_cm30_file(uploaded_file):
-    """Parse CM30 CSV export into a tidy dataframe with Well + Confluency."""
-    text = uploaded_file.read().decode("utf-8", errors="ignore")
-    lines = text.splitlines()
+def normalize_well_name(well_name, plate_type):
+    """Convert CM30 well labels into standard A1/B2 format."""
+    if well_name.startswith("Well"):
+        core = well_name[4:]  # strip "Well"
+        if core.isdigit():
+            # Numbered wells (seen in 6-well plates)
+            rows, cols = PLATE_LAYOUTS[plate_type]
+            num = int(core)
+            r = (num - 1) // len(cols)
+            c = (num - 1) % len(cols) + 1
+            return f"{rows[r]}{c}"
+        else:
+            # Already like A2, C7 etc.
+            return core
+    return well_name
 
-    # Detect plate type
-    plate_type = None
-    for i, line in enumerate(lines):
-        if line.strip().startswith("Plate"):
-            parts = line.split(",")
-            if len(parts) >= 6:
-                plate_type = parts[5].strip()
-                break
+def detect_plate_type(lines):
+    """Detect plate type from the <vessel Type> section."""
+    for line in lines:
+        if "well" in line.lower():
+            tokens = line.strip().replace("\t", ",").split(",")
+            for t in tokens:
+                if "well" in t.lower():
+                    return t.lower().strip()
+    return None
+
+def parse_cm30_file(file_content):
+    """Parse CM30 CSV-like file into dataframe with confluency values."""
+    lines = file_content.splitlines()
+    plate_type = detect_plate_type(lines)
     if plate_type not in PLATE_LAYOUTS:
-        raise ValueError(f"Unsupported or unknown plate type: {plate_type}")
+        raise ValueError(f"Unsupported or undetected plate type: {plate_type}")
 
-    # Find where results start
-    result_idx = None
-    result_type = None
-    for i, line in enumerate(lines):
-        if line.strip() == "<Single Result>":
-            result_idx, result_type = i, "single"
-            break
-        if line.strip() == "<Colony Forming Result>":
-            result_idx, result_type = i, "colony"
-            break
-    if result_idx is None:
-        raise ValueError("No results section (<Single Result> or <Colony Forming Result>) found.")
-
-    # Parse section after results
     data = {}
-    well_name, collecting = None, False
-    for line in lines[result_idx+1:]:
-        if line.startswith("Well"):
-            well_name = line.strip()
-            data[well_name] = []
-            collecting = True
+    current_well = None
+    in_results = False
+
+    for line in lines:
+        line = line.strip()
+        if not line:
             continue
-        if collecting and line.strip() == "":
-            well_name, collecting = None, False
+        if line.startswith("<Single Result>") or line.startswith("<Colony Forming Result>"):
+            in_results = True
             continue
-        if collecting and well_name:
-            parts = line.split(",")
+        if in_results and line.startswith("Well"):
+            current_well = line.split(",")[0].strip()
+            data[current_well] = []
+            continue
+        if current_well and re.match(r"^\d+", line):  # data rows start with a number
+            parts = re.split(r"[\t,]", line)
             if len(parts) >= 4:
                 try:
                     conf = float(parts[2])
-                    data[well_name].append(conf)
+                    data[current_well].append(conf)
                 except ValueError:
-                    continue
+                    pass
 
-    # Aggregate (mean confluency per well)
+    if not data:
+        raise ValueError("No confluency data found")
+
     df = pd.DataFrame([
-        {"Well": well, "Confluency": pd.Series(vals).mean()}
+        {
+            "Well": normalize_well_name(well, plate_type),
+            "Confluency": pd.Series(vals).mean()
+        }
         for well, vals in data.items()
     ])
 
     return df, plate_type
 
-
-def generate_plate_layout(plate_type, data_df):
-    """Return dataframe with all wells for given plate_type merged with data_df."""
+def plot_plate(df, plate_type):
+    """Render a plate heatmap given dataframe and plate type."""
     rows, cols = PLATE_LAYOUTS[plate_type]
-    wells = [f"{r}{c}" for r in rows for c in range(1, cols+1)]
-    full_df = pd.DataFrame({"Well": wells})
-    merged = full_df.merge(data_df, on="Well", how="left")
-    return merged, rows, cols
 
-
-def plot_plate_heatmap(plate_df, rows, cols, vmin=0, vmax=100):
-    """Render heatmap of plate data with missing wells in black."""
-    fig, ax = plt.subplots(figsize=(cols, len(rows)))
-    ax.set_xlim(0, cols)
-    ax.set_ylim(0, len(rows))
-    ax.axis("off")
-
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    fig, ax = plt.subplots(figsize=(len(cols), len(rows)))
     cmap = plt.cm.viridis
+    norm = mcolors.Normalize(vmin=0, vmax=100)
 
+    # Draw each well
     for i, row in enumerate(rows):
-        for j in range(1, cols+1):
-            well = f"{row}{j}"
-            val = plate_df.loc[plate_df["Well"] == well, "Confluency"].values
-            color = "black"
-            if len(val) > 0 and pd.notna(val[0]):
-                color = cmap(norm(val[0]))
-            rect = patches.Rectangle((j-1, len(rows)-i-1), 1, 1,
-                                     facecolor=color, edgecolor="white")
+        for j, col in enumerate(cols):
+            well_id = f"{row}{col}"
+            val = df.loc[df["Well"] == well_id, "Confluency"]
+            if not val.empty:
+                color = cmap(norm(val.values[0]))
+            else:
+                color = "black"  # no data
+            rect = patches.Rectangle((j, i), 1, 1, facecolor=color, edgecolor="white")
             ax.add_patch(rect)
-            ax.text(j-0.5, len(rows)-i-0.5, well,
-                    ha="center", va="center", color="white", fontsize=8)
+            ax.text(j + 0.5, i + 0.5, well_id, ha="center", va="center", color="white")
 
+    ax.set_xlim(0, len(cols))
+    ax.set_ylim(0, len(rows))
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_title(f"{plate_type.upper()} Plate Confluency Heatmap")
+    plt.tight_layout()
     return fig
 
+# Streamlit app
+st.title("CM30 Plate Viewer")
 
-# ---------------- Streamlit UI ----------------
-st.title("CM30 Heatmap Viewer")
+uploaded_file = st.file_uploader("Upload a CM30 export file", type=["csv", "txt"])
 
-uploaded_file = st.file_uploader("Upload a CM30 CSV file", type=["csv"])
 if uploaded_file:
     try:
-        df, plate_type = parse_cm30_file(uploaded_file)
-        st.success(f"Detected plate type: {plate_type}")
-
-        plate_df, rows, cols = generate_plate_layout(plate_type, df)
-
-        vmin = st.number_input("Minimum value (color scale)", 0.0, 100.0, 0.0)
-        vmax = st.number_input("Maximum value (color scale)", 0.0, 100.0, 100.0)
-
-        fig = plot_plate_heatmap(plate_df, rows, cols, vmin, vmax)
+        content = uploaded_file.read().decode("utf-8-sig")
+        df, plate_type = parse_cm30_file(content)
+        st.write("Parsed Data:", df)
+        fig = plot_plate(df, plate_type)
         st.pyplot(fig)
-
-        # Download option
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=150)
-        st.download_button("Download heatmap as PNG",
-                           data=buf.getvalue(),
-                           file_name=f"heatmap_{plate_type}.png",
-                           mime="image/png")
     except Exception as e:
         st.error(f"Could not parse file: {e}")
