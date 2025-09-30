@@ -1,4 +1,4 @@
-import io, os, re
+import io, re
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")  # safe for packaging/headless
@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import matplotlib.colors as mcolors
 import streamlit as st
+from datetime import datetime
 
 # ------------------------
 # Plate layouts definition
@@ -25,7 +26,7 @@ def detect_plate_type(lines):
     for line in lines:
         lower = line.lower()
         if "well" in lower:
-            tokens = re.split(r"[\t,]", line.strip())
+            tokens = re.split(r"[\t, ]", line.strip())
             for t in tokens:
                 t_clean = t.strip().lower()
                 if t_clean in PLATE_LAYOUTS:
@@ -43,11 +44,11 @@ def parse_file(uploaded_file):
     if not plate_type:
         raise ValueError("Unsupported or undetected plate type in file.")
 
-    # Parse <Single Result> or <Colony Forming Result>
     data = {}
-    times = []
+    times = set()
     current_well = None
     in_results = False
+
     for line in lines:
         line = line.strip()
         if line.startswith("<Single Result>") or line.startswith("<Colony Forming Result>"):
@@ -65,14 +66,24 @@ def parse_file(uploaded_file):
             parts = line.split(",")
             if len(parts) >= 4:
                 try:
-                    t = parts[1].strip()
+                    t_raw = parts[1].strip()
                     conf = float(parts[2])
-                    data[current_well].append((t, conf))
-                    if t not in times:
-                        times.append(t)
+                    # Normalize timestamp
+                    try:
+                        t = datetime.strptime(t_raw, "%Y/%m/%d %H:%M")
+                    except:
+                        try:
+                            t = datetime.strptime(t_raw, "%m/%d/%Y %H:%M")
+                        except:
+                            t = None
+                    if t:
+                        data[current_well].append((t, conf))
+                        times.add(t)
                 except ValueError:
                     pass
 
+    # Sort times
+    times = sorted(list(times))
     return plate_type, data, times
 
 # ------------------------
@@ -90,11 +101,10 @@ def render_heatmap(plate_type, data, timepoint, cmap="viridis", vmin=0, vmax=100
             well_id = f"Well{row}{col}"
             val = None
             if well_id in data:
-                # find closest match to selected timepoint
-                for t, conf in data[well_id]:
-                    if t == timepoint:
-                        val = conf
-                        break
+                # get confluency closest in time
+                vals = [(abs((t - timepoint).total_seconds()), conf) for t, conf in data[well_id]]
+                if vals:
+                    _, val = min(vals, key=lambda x: x[0])
             color = cmap(norm(val)) if val is not None else "black"
             rect = patches.Rectangle((j, i), 1, 1, facecolor=color, edgecolor="white")
             ax.add_patch(rect)
@@ -121,11 +131,10 @@ if uploaded_file:
         plate_type, data, times = parse_file(uploaded_file)
         st.success(f"Detected plate type: {plate_type}")
 
-        # Timepoint slider
         if times:
             idx = st.slider("Select timepoint index", 0, len(times)-1, 0)
             timepoint = times[idx]
-            st.write(f"Selected time: **{timepoint}**")
+            st.write(f"Selected time: **{timepoint.strftime('%Y-%m-%d %H:%M')}**")
         else:
             timepoint = None
 
