@@ -6,7 +6,6 @@ import matplotlib
 matplotlib.use("Agg")  # safe for headless/cloud
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-import matplotlib.patches as patches
 
 import streamlit as st
 
@@ -117,18 +116,18 @@ def parse_cm30_file(uploaded_file):
     if df.empty:
         raise ValueError("No confluency data parsed")
 
+    # 5) Assign timepoint index per well (1..n per well)
     df = df.sort_values(["Well", "Time"])
     df["Timepoint"] = df.groupby("Well").cumcount() + 1
 
     return df, plate_type
 
 def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color):
-    """Draw circular wells with values (or NA) for a given timepoint index, plus outer box."""
+    """Draw circular wells with values (or NA) for a given timepoint index."""
     rows, ncols = PLATE_LAYOUTS[plate_type]
     nrows = len(rows)
 
-    # Smaller figure size
-    fig, ax = plt.subplots(figsize=(ncols * 0.6, nrows * 0.6))
+    fig, ax = plt.subplots(figsize=(ncols, nrows))
     ax.set_xlim(0, ncols)
     ax.set_ylim(0, nrows)
     ax.set_aspect("equal")
@@ -158,16 +157,9 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
             cx, cy = (c - 0.5, nrows - ri - 0.5)
             circ = plt.Circle((cx, cy), 0.42, facecolor=color, edgecolor="black", linewidth=0.6)
             ax.add_patch(circ)
-            ax.text(cx, cy, label, ha="center", va="center", fontsize=6, color="white")
+            ax.text(cx, cy, label, ha="center", va="center", fontsize=7, color="white")
 
-    # Add one rectangle around everything with slight padding
-    rect = patches.Rectangle(
-        (0 - 0.2, 0 - 0.2), ncols + 0.4, nrows + 0.4,
-        linewidth=1.5, edgecolor="black", facecolor="none"
-    )
-    ax.add_patch(rect)
-
-    ax.set_title(f"{plate_type} — Timepoint {t_index}", fontsize=10)
+    ax.set_title(f"{plate_type} — Timepoint {t_index}", fontsize=12)
     return fig
 
 # -------------------------
@@ -225,11 +217,18 @@ if uploaded_file:
         if pd.notna(tp_time):
             st.caption(f"Timepoint {t_index} start time: {tp_time}")
 
+        # --- UPDATED RENDERING SECTION ---
         fig = render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color)
-        st.pyplot(fig, dpi=220)
 
+        # Save at high DPI
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
+        buf.seek(0)
+
+        # Show smaller preview in Streamlit
+        st.image(buf, caption=f"{plate_type} — Timepoint {t_index}", width=450)
+
+        # Download current timepoint
         st.download_button(
             "Download current timepoint as PNG",
             buf.getvalue(),
@@ -237,6 +236,7 @@ if uploaded_file:
             mime="image/png",
         )
 
+        # Download all timepoints
         if st.button("Build ZIP of all timepoints"):
             all_buf = io.BytesIO()
             with zipfile.ZipFile(all_buf, "w") as zf:
