@@ -7,13 +7,20 @@ import matplotlib.patches as patches
 import matplotlib.colors as mcolors
 import streamlit as st
 
-# ---------- Plate type detection ----------
+# ---------------- Plate definitions ----------------
+plate_dims = {
+    "6well":  (2, 3),    # rows, cols
+    "12well": (3, 4),
+    "24well": (4, 6),
+    "96well": (8, 12),
+}
+
+# ---------------- Parsing functions ----------------
 def detect_plate_type(raw: str) -> str:
     """Detect plate type by parsing the <vessel Type> section and extracting VesselName."""
     lines = raw.splitlines()
     for i, line in enumerate(lines):
         if line.strip().startswith("<vessel Type>"):
-            # Header should be the next line, data row after that
             if i + 2 < len(lines):
                 header = lines[i+1].split(",")
                 values = lines[i+2].split(",")
@@ -23,108 +30,152 @@ def detect_plate_type(raw: str) -> str:
                         return values[idx].strip().lower()
     return "96well"  # fallback
 
-# Mapping of plate type to (rows, cols)
-plate_dims = {
-    "6well": (2, 3),
-    "12well": (3, 4),
-    "24well": (4, 6),
-    "96well": (8, 12),
-}
-
-# ---------- File parsing ----------
 def parse_file(uploaded) -> pd.DataFrame:
+    """Parse uploaded CSV into tidy DataFrame: Well, Time, Confluency, PlateType"""
     raw = uploaded.getvalue().decode("utf-8", errors="ignore")
+
+    # Detect plate type
     plate_type = detect_plate_type(raw)
 
-    # find all well data sections
+    # Which section to search
+    if "96well" in plate_type:
+        section = "<Single Result>"
+    else:
+        section = "<Colony Forming Result>"
+
+    m = None
+    try:
+        import re
+        m = re.search(section + r".*", raw, flags=re.S)
+    except Exception:
+        pass
+    if not m:
+        raise ValueError("Could not find data section")
+
+    block = m.group(0)
     dfs = []
-    lines = raw.splitlines()
-    current_well = None
-    buffer = []
-    for line in lines:
-        if line.startswith("Well") and not line.startswith("Well List"):
-            if current_well and buffer:
-                dfs.append(pd.read_csv(io.StringIO("\n".join(buffer))))
-                buffer = []
-            current_well = line.split(",")[0].strip()
-        if current_well:
-            buffer.append(line)
-    if current_well and buffer:
-        dfs.append(pd.read_csv(io.StringIO("\n".join(buffer))))
+    # split by "Well"
+    for well_block in block.split("Well"):
+        if not well_block.strip():
+            continue
+        lines = well_block.strip().splitlines()
+        well_name = lines[0].strip().replace(":", "").replace("\t", "")
+        if not well_name:
+            continue
+        try:
+            df = pd.read_csv(io.StringIO("\n".join(lines[1:])))
+        except Exception:
+            continue
+        df["Well"] = well_name
+        dfs.append(df)
 
     if not dfs:
         raise ValueError("Parsed no data rows")
 
-    # tag each DF with well name
-    out = []
-    for df, (well,) in zip(dfs, [(l.split(",")[0].strip(),) for l in lines if l.startswith("Well") and not l.startswith("Well List")]):
-        df["Well"] = well
-        out.append(df)
-
-    all_df = pd.concat(out, ignore_index=True)
+    all_df = pd.concat(dfs, ignore_index=True)
 
     # normalize column names
     all_df = all_df.rename(columns=lambda c: c.strip())
-    if "Estimatevalue(Confluency)" not in all_df.columns:
-        raise ValueError("No confluency column found")
-    return plate_type, all_df
 
-# ---------- Heatmap drawing ----------
-def plot_plate(plate_type, df, timepoint, vmin=0, vmax=100, cmap="Reds"):
-    nrows, ncols = plate_dims.get(plate_type, (8, 12))
+    # find confluency column flexibly
+    confluency_col = None
+    for c in all_df.columns:
+        if "confluency" in c.lower():
+            confluency_col = c
+            break
+    if not confluency_col:
+        raise ValueError(f"No confluency column found in columns: {list(all_df.columns)}")
+
+    # standardize name
+    all_df = all_df.rename(columns={confluency_col: "Confluency"})
+
+    # Convert time
+    if "Time" in all_df.columns:
+        all_df["Time"] = pd.to_datetime(all_df["Time"], errors="coerce")
+
+    all_df["PlateType"] = plate_type
+    return all_df
+
+# ---------------- Plotting ----------------
+def plot_plate(df: pd.DataFrame, timepoint: int, vmin: float, vmax: float,
+               cmap_name="Reds", dpi=220):
+    """Plot one timepoint of a plate as heatmap-like wells."""
+    plate_type = df["PlateType"].iloc[0]
+    rows, cols = plate_dims.get(plate_type, (8, 12))
+
     wells = sorted(df["Well"].unique())
+    wells_this_tp = (
+        df.groupby("Well").nth(timepoint, dropna="any").reset_index()
+    )
+    if wells_this_tp.empty:
+        raise ValueError(f"No data for timepoint {timepoint}")
 
-    # pivot by time
-    df_time = df[df["Time"] == timepoint]
-
-    fig, ax = plt.subplots(figsize=(ncols, nrows))
-    ax.set_xlim(0, ncols)
-    ax.set_ylim(0, nrows)
+    fig, ax = plt.subplots(figsize=(cols, rows))
     ax.set_aspect("equal")
+    ax.set_xlim(0, cols)
+    ax.set_ylim(0, rows)
     ax.axis("off")
 
+    cmap = plt.get_cmap(cmap_name)
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-    cmap = plt.get_cmap(cmap)
 
-    for i, well in enumerate(wells):
-        row = i // ncols
-        col = i % ncols
-        val = df_time[df_time["Well"] == well]["Estimatevalue(Confluency)"]
-        if len(val) > 0:
-            color = cmap(norm(float(val.iloc[0])))
-        else:
+    # draw wells
+    for i, well in enumerate(sorted(df["Well"].unique())):
+        row = i // cols
+        col = i % cols
+        rec = wells_this_tp[wells_this_tp["Well"] == well]
+        if rec.empty or pd.isna(rec["Confluency"].iloc[0]) or rec["Confluency"].iloc[0] < 0:
             color = "black"
-        circle = plt.Circle((col+0.5, nrows-row-0.5), 0.4,
-                            facecolor=color, edgecolor="black")
-        ax.add_patch(circle)
-        ax.text(col+0.5, nrows-row-0.5, well.replace("Well", ""),
-                ha="center", va="center", fontsize=6, color="white")
+            val = None
+        else:
+            val = rec["Confluency"].iloc[0]
+            color = cmap(norm(val))
+        circ = patches.Circle((col+0.5, rows-row-0.5), 0.4,
+                              facecolor=color, edgecolor="black")
+        ax.add_patch(circ)
+        if val is not None:
+            ax.text(col+0.5, rows-row-0.5, f"{val:.0f}%",
+                    ha="center", va="center", fontsize=8, color="white")
 
     return fig
 
-# ---------- Streamlit UI ----------
-st.title("📊 Plate Heatmap Viewer")
+# ---------------- Streamlit App ----------------
+st.title("📊 Well Plate Confluency Heatmapper")
 
-uploaded = st.file_uploader("Upload CSV", type="csv")
+uploaded = st.file_uploader("Upload CSV export", type=["csv"])
 if uploaded:
     try:
-        plate_type, df = parse_file(uploaded)
-        st.success(f"Detected plate type: **{plate_type}**")
+        df = parse_file(uploaded)
+        st.success(f"Parsed {len(df)} rows from {df['PlateType'].iloc[0]}")
 
-        timepoints = sorted(df["Time"].unique())
-        timepoint = st.selectbox("Select timepoint", timepoints)
+        max_tp = df.groupby("Well").size().max() - 1
+        tp = st.slider("Timepoint index", 0, int(max_tp), 0)
+        target_conf = st.number_input("Target confluency", value=100, min_value=1)
 
-        vmin = st.number_input("Min % (color scale)", 0, 100, 0)
-        vmax = st.number_input("Max % (color scale)", 0, 100, 100)
+        fig = plot_plate(df, tp, vmin=0, vmax=target_conf)
+        st.pyplot(fig)
 
-        if st.button("Generate Heatmap"):
-            fig = plot_plate(plate_type, df, timepoint, vmin=vmin, vmax=vmax)
-            st.pyplot(fig)
+        # download current image
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=220)
+        buf.seek(0)
+        st.download_button("Download current PNG", buf,
+                           file_name=f"plate_tp{tp}.png", mime="image/png")
 
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png", dpi=220)
-            buf.seek(0)
-            st.download_button("Download PNG", buf, file_name="heatmap.png", mime="image/png")
+        # download all
+        if st.button("Download all timepoints as ZIP"):
+            tmpbuf = io.BytesIO()
+            with zipfile.ZipFile(tmpbuf, "w") as zf:
+                for t in range(int(max_tp)+1):
+                    fig = plot_plate(df, t, vmin=0, vmax=target_conf)
+                    img_buf = io.BytesIO()
+                    fig.savefig(img_buf, format="png", dpi=220)
+                    img_buf.seek(0)
+                    zf.writestr(f"plate_tp{t}.png", img_buf.read())
+                    plt.close(fig)
+            tmpbuf.seek(0)
+            st.download_button("Download ZIP", tmpbuf,
+                               file_name="all_timepoints.zip", mime="application/zip")
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
