@@ -6,6 +6,7 @@ import matplotlib
 matplotlib.use("Agg")  # safe for headless/cloud
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.patches as patches
 
 import streamlit as st
 
@@ -99,7 +100,6 @@ def parse_cm30_file(uploaded_file):
             continue
 
         # b) Data row under a current well
-        # Expected: [Passage#, Time, Confluency, Count, ...] but we only need 2/3
         if current_well and len(toks) >= 3:
             t = pd.to_datetime(toks[1], errors="coerce")
             v = pd.to_numeric(toks[2], errors="coerce")
@@ -109,7 +109,6 @@ def parse_cm30_file(uploaded_file):
     # 4) Build dataframe
     records = []
     for well, vals in data.items():
-        # sort by time within well to get consistent timepoint indexing
         vals = sorted(vals, key=lambda x: x[0])
         for t, v in vals:
             records.append({"Well": well, "Time": t, "Confluency": v})
@@ -118,18 +117,18 @@ def parse_cm30_file(uploaded_file):
     if df.empty:
         raise ValueError("No confluency data parsed")
 
-    # 5) Assign timepoint index per well (1..n per well)
     df = df.sort_values(["Well", "Time"])
     df["Timepoint"] = df.groupby("Well").cumcount() + 1
 
     return df, plate_type
 
 def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color):
-    """Draw circular wells with values (or NA) for a given timepoint index."""
+    """Draw circular wells with values (or NA) for a given timepoint index, plus outer box."""
     rows, ncols = PLATE_LAYOUTS[plate_type]
     nrows = len(rows)
 
-    fig, ax = plt.subplots(figsize=(ncols, nrows))
+    # Smaller figure size
+    fig, ax = plt.subplots(figsize=(ncols * 0.6, nrows * 0.6))
     ax.set_xlim(0, ncols)
     ax.set_ylim(0, nrows)
     ax.set_aspect("equal")
@@ -156,13 +155,19 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
                 color = "black"
                 label = "NA"
 
-            # Circles centered at cell centers
             cx, cy = (c - 0.5, nrows - ri - 0.5)
             circ = plt.Circle((cx, cy), 0.42, facecolor=color, edgecolor="black", linewidth=0.6)
             ax.add_patch(circ)
-            ax.text(cx, cy, label, ha="center", va="center", fontsize=7, color="white")
+            ax.text(cx, cy, label, ha="center", va="center", fontsize=6, color="white")
 
-    ax.set_title(f"{plate_type} — Timepoint {t_index}", fontsize=12)
+    # Add one rectangle around everything with slight padding
+    rect = patches.Rectangle(
+        (0 - 0.2, 0 - 0.2), ncols + 0.4, nrows + 0.4,
+        linewidth=1.5, edgecolor="black", facecolor="none"
+    )
+    ax.add_patch(rect)
+
+    ax.set_title(f"{plate_type} — Timepoint {t_index}", fontsize=10)
     return fig
 
 # -------------------------
@@ -181,14 +186,11 @@ st.markdown(
 
 uploaded_file = st.file_uploader("", type=["csv"], label_visibility="collapsed")
 
-
 if uploaded_file:
     try:
         df, plate_type = parse_cm30_file(uploaded_file)
 
-        # Available timepoints
         tpoints = sorted(df["Timepoint"].unique())
-        # First imaging time per timepoint (for display)
         times_by_tp = (
             df.sort_values("Time")
               .groupby("Timepoint")["Time"]
@@ -196,7 +198,6 @@ if uploaded_file:
               .reindex(tpoints)
         )
 
-        # Sidebar controls (min/max + colors side-by-side)
         st.sidebar.subheader("Confluency Range & Colors")
 
         col1, col2 = st.sidebar.columns([2, 1], gap="small")
@@ -211,7 +212,6 @@ if uploaded_file:
         with col4:
             max_color = st.color_picker("Color at Max %", "#8B0000")
 
-        # Timepoint slider
         t_index = st.slider(
             "Select timepoint",
             min_value=int(min(tpoints)),
@@ -221,16 +221,13 @@ if uploaded_file:
             format="Timepoint %d",
         )
 
-        # Show the timestamp for this timepoint (first well captured)
         tp_time = times_by_tp.loc[t_index]
         if pd.notna(tp_time):
             st.caption(f"Timepoint {t_index} start time: {tp_time}")
 
-        # Render
         fig = render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color)
         st.pyplot(fig, dpi=220)
 
-        # Download current as PNG
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
         st.download_button(
@@ -240,7 +237,6 @@ if uploaded_file:
             mime="image/png",
         )
 
-        # Download all timepoints as ZIP (on demand)
         if st.button("Build ZIP of all timepoints"):
             all_buf = io.BytesIO()
             with zipfile.ZipFile(all_buf, "w") as zf:
@@ -259,7 +255,3 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
-
-
-
-
