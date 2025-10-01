@@ -47,9 +47,11 @@ def normalize_well_name(well_name: str, plate_type: str) -> str:
         return name
 
     core = name[4:]  # after 'Well'
+    # Case 1: already letter+number (e.g., A1, B12)
     if core and core[0].isalpha():
         return core.upper()
 
+    # Case 2: pure digits (e.g., '1'..'6') -> map into grid
     if core.isdigit():
         rows, ncols = PLATE_LAYOUTS[plate_type]
         idx = int(core)
@@ -57,24 +59,29 @@ def normalize_well_name(well_name: str, plate_type: str) -> str:
         c = (idx - 1) % ncols + 1
         if 0 <= r < len(rows):
             return f"{rows[r]}{c}"
+    # Fallback: return unchanged core
     return core.upper()
 
 def parse_cm30_file(uploaded_file):
-    """Parse CM30 CSV/TSV text into dataframe + plate type + project name."""
+    """Parse CM30 CSV/TSV text into tidy dataframe with Well, Time, Confluency, Timepoint."""
     text = uploaded_file.read().decode("utf-8", errors="ignore")
     lines = text.splitlines()
 
-    project_name = "Unknown Project"
-    for i, line in enumerate(lines[:10]):
-        toks = split_tokens(line)
-        if toks and toks[0].lower() == "name" and len(lines) > i+1:
-            project_name = split_tokens(lines[i+1])[0]
-            break
-
+    # 1) Detect plate type
     plate_type = detect_plate_type(lines)
     if plate_type is None:
         raise ValueError("Unsupported or undetected plate type")
 
+    # 2) Grab project name from header
+    project_name = None
+    for line in lines:
+        if line.lower().startswith("name"):
+            toks = split_tokens(line)
+            if len(toks) > 1:
+                project_name = toks[1]
+            break
+
+    # 3) Find start of result section
     start_idx = None
     for i, line in enumerate(lines):
         l = line.lower()
@@ -84,6 +91,7 @@ def parse_cm30_file(uploaded_file):
     if start_idx is None:
         raise ValueError("No result section found")
 
+    # 4) Walk lines, collect rows
     data = {}
     current_well = None
 
@@ -94,16 +102,19 @@ def parse_cm30_file(uploaded_file):
         if not toks:
             continue
 
+        # a) New well header? e.g., 'WellA1' or 'Well1'
         if toks[0].startswith("Well"):
             current_well = normalize_well_name(toks[0], plate_type)
             continue
 
+        # b) Data row under a current well
         if current_well and len(toks) >= 3:
             t = pd.to_datetime(toks[1], errors="coerce")
             v = pd.to_numeric(toks[2], errors="coerce")
             if pd.notna(t) and pd.notna(v):
                 data.setdefault(current_well, []).append((t, v))
 
+    # 5) Build dataframe
     records = []
     for well, vals in data.items():
         vals = sorted(vals, key=lambda x: x[0])
@@ -119,22 +130,25 @@ def parse_cm30_file(uploaded_file):
 
     return df, plate_type, project_name
 
-def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color, project_name, tp_time):
-    """Draw circular wells + black bounding box. Add row/col labels for 96well. Custom title."""
+def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color,
+                 project_name=None, tp_time=None, scale=1.0):
+    """Draw circular wells with values (or NA) for a given timepoint index."""
     rows, ncols = PLATE_LAYOUTS[plate_type]
     nrows = len(rows)
 
-    fig, ax = plt.subplots(figsize=(ncols*0.6, nrows*0.6))
+    fig, ax = plt.subplots(figsize=(ncols * scale, nrows * scale))
     ax.set_xlim(0, ncols)
     ax.set_ylim(0, nrows)
     ax.set_aspect("equal")
     ax.axis("off")
 
+    # colormap
     norm = mcolors.Normalize(vmin=min_val, vmax=max_val)
     cmap = mcolors.LinearSegmentedColormap.from_list("custom", [min_color, max_color])
 
     sub = df[df["Timepoint"] == t_index]
 
+    # draw full grid
     for ri, r in enumerate(rows):
         for c in range(1, ncols + 1):
             well = f"{r}{c}"
@@ -151,21 +165,28 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
             cx, cy = (c - 0.5, nrows - ri - 0.5)
             circ = plt.Circle((cx, cy), 0.42, facecolor=color, edgecolor="black", linewidth=0.6)
             ax.add_patch(circ)
-            ax.text(cx, cy, label, ha="center", va="center", fontsize=6, color="white")
+            ax.text(cx, cy, label, ha="center", va="center", fontsize=7, color="white")
 
-    rect = plt.Rectangle((0, 0), ncols, nrows, linewidth=1.2, edgecolor="black", facecolor="none")
-    ax.add_patch(rect)
+    # Outer rectangle
+    ax.add_patch(plt.Rectangle((0, 0), ncols, nrows, fill=False, edgecolor="black", linewidth=1.2))
 
+    # Labels for 96well only
     if plate_type == "96well":
-        for c in range(1, ncols + 1):
-            ax.text(c - 0.5, nrows + 0.4, str(c), ha="center", va="center",
-                    fontsize=10, fontweight="bold", color="black")
         for ri, r in enumerate(rows):
-            ax.text(-0.9, nrows - ri - 0.5, r, ha="center", va="center",
-                    fontsize=14, fontweight="bold", color="black")
+            cy = nrows - ri - 0.5
+            ax.text(-0.6, cy, r, ha="right", va="center", fontsize=10, fontweight="bold")
+        for c in range(1, ncols + 1):
+            cx = (c - 0.5)
+            ax.text(cx, nrows + 0.3, str(c), ha="center", va="bottom", fontsize=10, fontweight="bold")
 
-    tp_str = tp_time.strftime("%Y-%m-%d %H:%M") if pd.notna(tp_time) else "Unknown"
-    fig.suptitle(f"{project_name} — Timepoint {t_index} ({tp_str})", fontsize=12, y=1.05)
+    # Title
+    title = ""
+    if project_name:
+        title += f"{project_name} - "
+    title += f"Timepoint {t_index}"
+    if tp_time is not None and pd.notna(tp_time):
+        title += f" ({tp_time})"
+    ax.set_title(title, fontsize=12, pad=20)
 
     return fig
 
@@ -222,29 +243,44 @@ if uploaded_file:
 
         tp_time = times_by_tp.loc[t_index]
 
-        fig = render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color,
-                           project_name=project_name, tp_time=tp_time)
+        # Apply scaling logic
+        scale = 1.0
+        if plate_type == "6well":
+            scale = 2.0
+        elif plate_type == "12well":
+            scale = 1.5
+
+        # Render
+        fig = render_plate(
+            df, plate_type, t_index,
+            min_val, max_val, min_color, max_color,
+            project_name=project_name, tp_time=tp_time, scale=scale
+        )
         st.pyplot(fig, dpi=220)
 
-        # ⬇️ Add space before downloads
-        st.sidebar.markdown("<br><br>", unsafe_allow_html=True)
+        # Spacer before downloads
+        st.sidebar.markdown("<br>", unsafe_allow_html=True)
 
-        # ⬇️ Move download buttons to sidebar
+        # Download current as PNG
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
         st.sidebar.download_button(
-            "Download current timepoint image",
+            "Download current timepoint as PNG",
             buf.getvalue(),
             file_name=f"{plate_type}_timepoint_{t_index}.png",
             mime="image/png",
         )
 
+        # Download all timepoints as ZIP
         if st.sidebar.button("Build ZIP of all timepoints"):
             all_buf = io.BytesIO()
             with zipfile.ZipFile(all_buf, "w") as zf:
                 for tp in tpoints:
-                    fig_tp = render_plate(df, plate_type, tp, min_val, max_val, min_color, max_color,
-                                          project_name=project_name, tp_time=times_by_tp.loc[tp])
+                    fig_tp = render_plate(
+                        df, plate_type, tp,
+                        min_val, max_val, min_color, max_color,
+                        project_name=project_name, tp_time=times_by_tp.loc[tp], scale=scale
+                    )
                     tmp = io.BytesIO()
                     fig_tp.savefig(tmp, format="png", dpi=220, bbox_inches="tight")
                     zf.writestr(f"{plate_type}_timepoint_{tp}.png", tmp.getvalue())
@@ -258,5 +294,3 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
-
-
