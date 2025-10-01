@@ -112,7 +112,7 @@ def parse_cm30_file(uploaded_file):
     return df, plate_type
 
 def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color):
-    """Draw circular wells + black bounding box for given timepoint index."""
+    """Draw circular wells + black bounding box, with row/col labels for 96well."""
     rows, ncols = PLATE_LAYOUTS[plate_type]
     nrows = len(rows)
 
@@ -144,17 +144,20 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
             cx, cy = (c - 0.5, nrows - ri - 0.5)
             circ = plt.Circle((cx, cy), 0.42, facecolor=color, edgecolor="black", linewidth=0.6)
             ax.add_patch(circ)
-            ax.text(cx, cy, label, ha="center", va="center", fontsize=7, color="white")
+            ax.text(cx, cy, label, ha="center", va="center", fontsize=6, color="white")
 
-    # 🔲 Add single black rectangle around all wells
-    rect = plt.Rectangle(
-        (0, 0),
-        ncols, nrows,
-        linewidth=1.2,
-        edgecolor="black",
-        facecolor="none"
-    )
+    # 🔲 Add single black rectangle
+    rect = plt.Rectangle((0, 0), ncols, nrows, linewidth=1.2, edgecolor="black", facecolor="none")
     ax.add_patch(rect)
+
+    # 🏷️ Add labels only for 96well
+    if plate_type == "96well":
+        # Column numbers at top
+        for c in range(1, ncols + 1):
+            ax.text(c - 0.5, nrows + 0.3, str(c), ha="center", va="center", fontsize=6, color="black")
+        # Row letters at left
+        for ri, r in enumerate(rows):
+            ax.text(-0.6, nrows - ri - 0.5, r, ha="center", va="center", fontsize=6, color="black")
 
     ax.set_title(f"{plate_type} — Timepoint {t_index}", fontsize=12)
     return fig
@@ -247,3 +250,4 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
