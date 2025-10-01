@@ -71,13 +71,12 @@ def parse_cm30_file(uploaded_file):
     if plate_type is None:
         raise ValueError("Unsupported or undetected plate type")
 
-    # 2) Extract project name
-    project_name = None
+    # ✅ Project name: line after "Name"
+    project_name = "Unknown Project"
     for i, line in enumerate(lines[:20]):  # look near the top
-        if line.lower().startswith("name"):
-            parts = split_tokens(line)
-            if len(parts) > 1:
-                project_name = parts[1]
+        toks = split_tokens(line)
+        if toks and toks[0].lower() == "name" and len(lines) > i+1:
+            project_name = split_tokens(lines[i+1])[0]
             break
 
     # 3) Find start of result section
@@ -298,3 +297,4 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
