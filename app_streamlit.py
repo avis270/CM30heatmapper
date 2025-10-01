@@ -179,7 +179,7 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
         # Row letters at left (large)
         for ri, r in enumerate(rows):
             ax.text(-0.9, nrows - ri - 0.5, r, ha="center", va="center",
-                    fontsize=14, fontweight="bold", color="black")
+                    fontsize=10, fontweight="bold", color="black")
 
     # 📝 Title
     tp_str = tp_time.strftime("%Y-%m-%d %H:%M") if pd.notna(tp_time) else "Unknown"
@@ -280,3 +280,4 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
