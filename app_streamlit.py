@@ -195,9 +195,14 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
     if tp_time is not None and pd.notna(tp_time):
         title += f" ({tp_time})"
 
-    ax.set_title(title, fontsize=14, pad=35)
+    # Adjust padding: 96well needs extra room for column labels, others don't
+    if plate_type == "96well":
+        ax.set_title(title, fontsize=14, pad=35)
+    else:
+        ax.set_title(title, fontsize=14, pad=10)
 
     return fig
+
 
 # -------------------------
 # Streamlit App
@@ -297,4 +302,5 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
 
