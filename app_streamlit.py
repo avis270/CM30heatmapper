@@ -138,7 +138,7 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
 
     fig, ax = plt.subplots(figsize=(ncols * scale, nrows * scale))
     ax.set_xlim(0, ncols)
-    ax.set_ylim(0, nrows)
+    ax.set_ylim(0, nrows + 1)  # leave space above for title + col labels
     ax.set_aspect("equal")
     ax.axis("off")
 
@@ -147,6 +147,16 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
     cmap = mcolors.LinearSegmentedColormap.from_list("custom", [min_color, max_color])
 
     sub = df[df["Timepoint"] == t_index]
+
+    # font size scaling by plate type
+    if plate_type == "6well":
+        font_size = 14
+    elif plate_type == "12well":
+        font_size = 11
+    elif plate_type == "24well":
+        font_size = 9
+    else:  # 96well
+        font_size = 7
 
     # draw full grid
     for ri, r in enumerate(rows):
@@ -165,7 +175,7 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
             cx, cy = (c - 0.5, nrows - ri - 0.5)
             circ = plt.Circle((cx, cy), 0.42, facecolor=color, edgecolor="black", linewidth=0.6)
             ax.add_patch(circ)
-            ax.text(cx, cy, label, ha="center", va="center", fontsize=7, color="white")
+            ax.text(cx, cy, label, ha="center", va="center", fontsize=font_size, color="white")
 
     # Outer rectangle
     ax.add_patch(plt.Rectangle((0, 0), ncols, nrows, fill=False, edgecolor="black", linewidth=1.2))
@@ -174,19 +184,20 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
     if plate_type == "96well":
         for ri, r in enumerate(rows):
             cy = nrows - ri - 0.5
-            ax.text(-0.6, cy, r, ha="right", va="center", fontsize=10, fontweight="bold")
+            ax.text(-0.6, cy, r, ha="right", va="center", fontsize=12, fontweight="bold")
         for c in range(1, ncols + 1):
             cx = (c - 0.5)
-            ax.text(cx, nrows + 0.3, str(c), ha="center", va="bottom", fontsize=10, fontweight="bold")
+            ax.text(cx, nrows + 0.3, str(c), ha="center", va="bottom", fontsize=12, fontweight="bold")
 
-    # Title
+    # Title: always above col labels
     title = ""
     if project_name:
-        title += f"{project_name} - "
+        title += f"{project_name} – "
     title += f"Timepoint {t_index}"
     if tp_time is not None and pd.notna(tp_time):
         title += f" ({tp_time})"
-    ax.set_title(title, fontsize=12, pad=20)
+
+    ax.set_title(title, fontsize=14, pad=35)  # push higher so it's above col labels
 
     return fig
 
@@ -294,3 +305,4 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
