@@ -59,7 +59,6 @@ def normalize_well_name(well_name: str, plate_type: str) -> str:
         c = (idx - 1) % ncols + 1
         if 0 <= r < len(rows):
             return f"{rows[r]}{c}"
-    # Fallback: return unchanged core
     return core.upper()
 
 def parse_cm30_file(uploaded_file):
@@ -72,13 +71,13 @@ def parse_cm30_file(uploaded_file):
     if plate_type is None:
         raise ValueError("Unsupported or undetected plate type")
 
-    # 2) Grab project name from header
+    # 2) Extract project name
     project_name = None
-    for line in lines:
+    for i, line in enumerate(lines[:20]):  # look near the top
         if line.lower().startswith("name"):
-            toks = split_tokens(line)
-            if len(toks) > 1:
-                project_name = toks[1]
+            parts = split_tokens(line)
+            if len(parts) > 1:
+                project_name = parts[1]
             break
 
     # 3) Find start of result section
@@ -102,12 +101,12 @@ def parse_cm30_file(uploaded_file):
         if not toks:
             continue
 
-        # a) New well header? e.g., 'WellA1' or 'Well1'
+        # new well header
         if toks[0].startswith("Well"):
             current_well = normalize_well_name(toks[0], plate_type)
             continue
 
-        # b) Data row under a current well
+        # data row
         if current_well and len(toks) >= 3:
             t = pd.to_datetime(toks[1], errors="coerce")
             v = pd.to_numeric(toks[2], errors="coerce")
@@ -138,7 +137,7 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
 
     fig, ax = plt.subplots(figsize=(ncols * scale, nrows * scale))
     ax.set_xlim(0, ncols)
-    ax.set_ylim(0, nrows + 1)  # leave space above for title + col labels
+    ax.set_ylim(0, nrows + 1)
     ax.set_aspect("equal")
     ax.axis("off")
 
@@ -158,7 +157,7 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
     else:  # 96well
         font_size = 7
 
-    # draw full grid
+    # draw wells
     for ri, r in enumerate(rows):
         for c in range(1, ncols + 1):
             well = f"{r}{c}"
@@ -177,10 +176,10 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
             ax.add_patch(circ)
             ax.text(cx, cy, label, ha="center", va="center", fontsize=font_size, color="white")
 
-    # Outer rectangle
+    # black rectangle
     ax.add_patch(plt.Rectangle((0, 0), ncols, nrows, fill=False, edgecolor="black", linewidth=1.2))
 
-    # Labels for 96well only
+    # labels for 96well
     if plate_type == "96well":
         for ri, r in enumerate(rows):
             cy = nrows - ri - 0.5
@@ -189,7 +188,7 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
             cx = (c - 0.5)
             ax.text(cx, nrows + 0.3, str(c), ha="center", va="bottom", fontsize=12, fontweight="bold")
 
-    # Title: always above col labels
+    # title
     title = ""
     if project_name:
         title += f"{project_name} – "
@@ -197,7 +196,7 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
     if tp_time is not None and pd.notna(tp_time):
         title += f" ({tp_time})"
 
-    ax.set_title(title, fontsize=14, pad=35)  # push higher so it's above col labels
+    ax.set_title(title, fontsize=14, pad=35)
 
     return fig
 
@@ -221,6 +220,7 @@ if uploaded_file:
     try:
         df, plate_type, project_name = parse_cm30_file(uploaded_file)
 
+        # Available timepoints
         tpoints = sorted(df["Timepoint"].unique())
         times_by_tp = (
             df.sort_values("Time")
@@ -229,8 +229,8 @@ if uploaded_file:
               .reindex(tpoints)
         )
 
-        st.sidebar.subheader("Confluency Range & Colors")
-
+        # Sidebar controls
+        st.sidebar.markdown("<br><br>", unsafe_allow_html=True)  # space
         col1, col2 = st.sidebar.columns([2, 1], gap="small")
         with col1:
             min_val = st.number_input("Min %", value=0.0, step=1.0)
@@ -243,6 +243,7 @@ if uploaded_file:
         with col4:
             max_color = st.color_picker("Color at Max %", "#8B0000")
 
+        # Timepoint slider
         t_index = st.slider(
             "Select timepoint",
             min_value=int(min(tpoints)),
@@ -254,25 +255,21 @@ if uploaded_file:
 
         tp_time = times_by_tp.loc[t_index]
 
-        # Apply scaling logic
-        scale = 1.0
+        # scaling
         if plate_type == "6well":
             scale = 2.0
         elif plate_type == "12well":
             scale = 1.5
+        else:
+            scale = 1.0
 
         # Render
-        fig = render_plate(
-            df, plate_type, t_index,
-            min_val, max_val, min_color, max_color,
-            project_name=project_name, tp_time=tp_time, scale=scale
-        )
+        fig = render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color,
+                           project_name=project_name, tp_time=tp_time, scale=scale)
         st.pyplot(fig, dpi=220)
 
-        # Spacer before downloads
-        st.sidebar.markdown("<br>", unsafe_allow_html=True)
-
-        # Download current as PNG
+        # Sidebar download buttons
+        st.sidebar.markdown("<br><br>", unsafe_allow_html=True)
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
         st.sidebar.download_button(
@@ -282,16 +279,12 @@ if uploaded_file:
             mime="image/png",
         )
 
-        # Download all timepoints as ZIP
         if st.sidebar.button("Build ZIP of all timepoints"):
             all_buf = io.BytesIO()
             with zipfile.ZipFile(all_buf, "w") as zf:
                 for tp in tpoints:
-                    fig_tp = render_plate(
-                        df, plate_type, tp,
-                        min_val, max_val, min_color, max_color,
-                        project_name=project_name, tp_time=times_by_tp.loc[tp], scale=scale
-                    )
+                    fig_tp = render_plate(df, plate_type, tp, min_val, max_val,
+                                          min_color, max_color, project_name, times_by_tp.loc[tp], scale)
                     tmp = io.BytesIO()
                     fig_tp.savefig(tmp, format="png", dpi=220, bbox_inches="tight")
                     zf.writestr(f"{plate_type}_timepoint_{tp}.png", tmp.getvalue())
@@ -305,4 +298,3 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
-
