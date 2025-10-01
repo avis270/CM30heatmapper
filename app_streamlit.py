@@ -136,7 +136,10 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
 
     fig, ax = plt.subplots(figsize=(ncols * scale, nrows * scale))
     ax.set_xlim(0, ncols)
-    ax.set_ylim(0, nrows + 1)
+    if plate_type == "96well":
+        ax.set_ylim(0, nrows + 1)  # leave space for column labels
+    else:
+        ax.set_ylim(0, nrows)
     ax.set_aspect("equal")
     ax.axis("off")
 
@@ -302,6 +305,7 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
 
 
 
