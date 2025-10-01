@@ -226,6 +226,9 @@ if uploaded_file:
                            project_name=project_name, tp_time=tp_time)
         st.pyplot(fig, dpi=220)
 
+        # ⬇️ Add space before downloads
+        st.sidebar.markdown("<br>", unsafe_allow_html=True)
+
         # ⬇️ Move download buttons to sidebar
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
@@ -255,3 +258,4 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
