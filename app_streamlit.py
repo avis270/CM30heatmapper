@@ -197,9 +197,9 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
 
     # Adjust padding: 96well needs extra room for column labels, others don't
     if plate_type == "96well":
-        ax.set_title(title, fontsize=14, pad=35)
+        ax.set_title(title, fontsize=14, pad=25)
     else:
-        ax.set_title(title, fontsize=14, pad=10)
+        ax.set_title(title, fontsize=14, pad=1)
 
     return fig
 
@@ -302,5 +302,6 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
 
 
