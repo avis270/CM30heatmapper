@@ -59,7 +59,6 @@ def normalize_well_name(well_name: str, plate_type: str) -> str:
         c = (idx - 1) % ncols + 1
         if 0 <= r < len(rows):
             return f"{rows[r]}{c}"
-    # Fallback: return unchanged core
     return core.upper()
 
 def parse_cm30_file(uploaded_file):
@@ -67,12 +66,10 @@ def parse_cm30_file(uploaded_file):
     text = uploaded_file.read().decode("utf-8", errors="ignore")
     lines = text.splitlines()
 
-    # 1) Detect plate type
     plate_type = detect_plate_type(lines)
     if plate_type is None:
         raise ValueError("Unsupported or undetected plate type")
 
-    # 2) Find start of result section
     start_idx = None
     for i, line in enumerate(lines):
         l = line.lower()
@@ -82,30 +79,23 @@ def parse_cm30_file(uploaded_file):
     if start_idx is None:
         raise ValueError("No result section found")
 
-    # 3) Walk lines, collect rows
     data = {}
     current_well = None
-
     for raw in lines[start_idx + 1:]:
         if not raw.strip():
             continue
         toks = split_tokens(raw)
         if not toks:
             continue
-
-        # a) New well header? e.g., 'WellA1' or 'Well1'
         if toks[0].startswith("Well"):
             current_well = normalize_well_name(toks[0], plate_type)
             continue
-
-        # b) Data row under a current well
         if current_well and len(toks) >= 3:
             t = pd.to_datetime(toks[1], errors="coerce")
             v = pd.to_numeric(toks[2], errors="coerce")
             if pd.notna(t) and pd.notna(v):
                 data.setdefault(current_well, []).append((t, v))
 
-    # 4) Build dataframe
     records = []
     for well, vals in data.items():
         vals = sorted(vals, key=lambda x: x[0])
@@ -116,14 +106,13 @@ def parse_cm30_file(uploaded_file):
     if df.empty:
         raise ValueError("No confluency data parsed")
 
-    # 5) Assign timepoint index per well (1..n per well)
     df = df.sort_values(["Well", "Time"])
     df["Timepoint"] = df.groupby("Well").cumcount() + 1
 
     return df, plate_type
 
 def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color):
-    """Draw circular wells with values (or NA) for a given timepoint index."""
+    """Draw circular wells + black bounding box for given timepoint index."""
     rows, ncols = PLATE_LAYOUTS[plate_type]
     nrows = len(rows)
 
@@ -137,10 +126,8 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
     norm = mcolors.Normalize(vmin=min_val, vmax=max_val)
     cmap = mcolors.LinearSegmentedColormap.from_list("custom", [min_color, max_color])
 
-    # subset for selected timepoint
     sub = df[df["Timepoint"] == t_index]
 
-    # draw full grid
     for ri, r in enumerate(rows):
         for c in range(1, ncols + 1):
             well = f"{r}{c}"
@@ -158,6 +145,16 @@ def render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color
             circ = plt.Circle((cx, cy), 0.42, facecolor=color, edgecolor="black", linewidth=0.6)
             ax.add_patch(circ)
             ax.text(cx, cy, label, ha="center", va="center", fontsize=7, color="white")
+
+    # 🔲 Add single black rectangle around all wells
+    rect = plt.Rectangle(
+        (0, 0),
+        ncols, nrows,
+        linewidth=1.2,
+        edgecolor="black",
+        facecolor="none"
+    )
+    ax.add_patch(rect)
 
     ax.set_title(f"{plate_type} — Timepoint {t_index}", fontsize=12)
     return fig
@@ -217,18 +214,14 @@ if uploaded_file:
         if pd.notna(tp_time):
             st.caption(f"Timepoint {t_index} start time: {tp_time}")
 
-        # --- UPDATED RENDERING SECTION ---
         fig = render_plate(df, plate_type, t_index, min_val, max_val, min_color, max_color)
 
-        # Save at high DPI
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
         buf.seek(0)
 
-        # Show smaller preview in Streamlit
         st.image(buf, caption=f"{plate_type} — Timepoint {t_index}", width=450)
 
-        # Download current timepoint
         st.download_button(
             "Download current timepoint as PNG",
             buf.getvalue(),
@@ -236,7 +229,6 @@ if uploaded_file:
             mime="image/png",
         )
 
-        # Download all timepoints
         if st.button("Build ZIP of all timepoints"):
             all_buf = io.BytesIO()
             with zipfile.ZipFile(all_buf, "w") as zf:
