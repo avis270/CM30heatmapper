@@ -280,7 +280,7 @@ if uploaded_file:
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=220, bbox_inches="tight")
         st.sidebar.download_button(
-            "Download current timepoint as PNG",
+            "Download current timepoint",
             buf.getvalue(),
             file_name=f"{plate_type}_timepoint_{t_index}.png",
             mime="image/png",
@@ -305,6 +305,7 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Could not parse file: {e}")
+
 
 
 
