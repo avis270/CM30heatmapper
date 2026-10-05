@@ -668,11 +668,22 @@ def _ordered_levels(fi):
     return list(st.session_state["an_levels"].get(fi, []))
 
 
+FAMILIES = [
+    ["#0072B2", "#56B4E9", "#2C3E50", "#5E60CE", "#7A7A7A", "#8E44AD"],      # condition 1: blues and purples
+    ["#E69F00", "#D55E00", "#F4A261", "#C0392B", "#B8860B", "#E76F51"],      # condition 2: oranges and reds
+    ["#009E73", "#2A9D8F", "#6A994E", "#95D5B2", "#386641", "#52B788"],      # condition 3: greens
+    ["#CC79A7", "#D4537E", "#9D4EDD", "#F28482", "#8E3B6B", "#B5179E"],      # condition 4: pinks
+    ["#8D6E63", "#E0C200", "#607D8B", "#A1887F", "#C9A227", "#455A64"],      # condition 5: browns and grays
+]
+
+
 def _color(fi, level):
+    """Each condition draws its levels from its own color family, so wedges of different conditions stay apart."""
     ss = st.session_state
     if (fi, level) not in ss["an_colors"]:
         used = sum(1 for k in ss["an_colors"] if k[0] == fi)
-        ss["an_colors"][(fi, level)] = PALETTE[used % len(PALETTE)]
+        fam = FAMILIES[fi % len(FAMILIES)]
+        ss["an_colors"][(fi, level)] = fam[used % len(fam)]
     return ss["an_colors"][(fi, level)]
 
 
@@ -704,9 +715,9 @@ def _clear_plate():
     _bump()
 
 
-def _pick_brush(fi, key):
-    val = st.session_state.get(key)
-    st.session_state["an_brush"] = None if val is None else (fi, val)
+def _set_brush(fi, level):
+    ss = st.session_state
+    ss["an_brush"] = None if ss.get("an_brush") == (fi, level) else (fi, level)
 
 
 def _add_level(fi, key):
@@ -793,6 +804,8 @@ def _delete_condition(fi):
     ss["an_brush"] = None
     for i in range(MAX_F):
         ss[f"an_name_w{i}"] = ss["an_names"][i]
+    for k in [k for k in ss.keys() if isinstance(k, str) and k.startswith(("an_cp_", "an_rn_", "an_new_"))]:
+        del ss[k]
     _bump()
 
 
@@ -800,28 +813,69 @@ def _toggle_hide():
     st.session_state["an_hide"] = not st.session_state.get("an_hide", False)
 
 
-def layout_plate_figure(meta, wells, layout, color_fi, names):
+UNASSIGNED = "#F3F4F6"
+
+
+def _active_conditions(nf):
+    act = [i for i in range(nf) if st.session_state["an_levels"].get(i)]
+    return act or [0]
+
+
+def _arc(cx, cy, r, a0, a1, n=26):
+    th = np.radians(np.linspace(a0, a1, n))
+    return cx + r * np.cos(th), cy + r * np.sin(th)
+
+
+def layout_plate_figure(meta, wells, layout, names, active):
+    """Each well is split into one wedge per active condition (clockwise from the top)."""
     rows, cols = meta["rows"], meta["cols"]
-    cell = min(72.0, 600.0 / cols)
+    cap = 110.0 if cols <= 4 else 80.0 if cols <= 6 else 64.0
+    cell = min(cap, 600.0 / cols)
     size = cell * 0.84
-    xs, ys, fills, syms, texts, tcols, hov, lcol, lw = [], [], [], [], [], [], [], [], []
+    r, n = 0.42, len(active)
+    groups, ring_x, ring_y, cross_x, cross_y = {}, [], [], [], []
+    hx, hy, hov, tag_x, tag_y, tag_t = [], [], [], [], [], []
     for w in wells:
         i, j = _well_pos(w, meta)
-        r = layout.loc[w]
-        lvl, excl = r[f"f{color_fi}"], bool(r["Excluded"])
-        fill = _color(color_fi, lvl) if lvl else "#F3F4F6"
-        xs.append(j + 0.5); ys.append(i + 0.5); fills.append(fill)
-        syms.append("circle-x" if excl else "circle")
-        lcol.append("#111827" if excl else "#6B7280"); lw.append(2 if excl else 1)
-        texts.append(w if size >= 26 else "")
-        tcols.append(_text_on(_rgb(fill)))
-        hov.append(f"<b>Well {w}</b>" + "".join(f"<br>{names[k]}: {r[f'f{k}'] or '-'}" for k in range(len(names)))
+        cx, cy = j + 0.5, i + 0.5
+        row = layout.loc[w]
+        for k, fi in enumerate(active):
+            lvl = row[f"f{fi}"]
+            color = _color(fi, lvl) if lvl else UNASSIGNED
+            ax, ay = _arc(cx, cy, r, -90 + 360 * k / n, -90 + 360 * (k + 1) / n)
+            if n > 1:
+                ax, ay = np.concatenate([[cx], ax, [cx]]), np.concatenate([[cy], ay, [cy]])
+            g = groups.setdefault(color, ([], []))
+            g[0].extend(ax.tolist() + [None]); g[1].extend(ay.tolist() + [None])
+        rx, ry = _arc(cx, cy, r, 0, 360, 60)
+        ring_x.extend(rx.tolist() + [None]); ring_y.extend(ry.tolist() + [None])
+        excl = bool(row["Excluded"])
+        if excl:
+            d = r * 0.55
+            cross_x.extend([cx - d, cx + d, None, cx - d, cx + d, None])
+            cross_y.extend([cy - d, cy + d, None, cy + d, cy - d, None])
+        hx.append(cx); hy.append(cy)
+        hov.append(f"<b>Well {w}</b>" + "".join(f"<br>{names[k]}: {row[f'f{k}'] or '-'}" for k in range(len(names)))
                    + ("<br><b>Excluded from analysis</b>" if excl else ""))
-    fig = go.Figure(go.Scatter(
-        x=xs, y=ys, mode="markers+text", text=texts, textfont=dict(size=10 if cols > 12 else 11, color=tcols),
-        marker=dict(size=size, color=fills, symbol=syms, line=dict(color=lcol, width=lw)),
-        selected=dict(marker=dict(opacity=1)), unselected=dict(marker=dict(opacity=0.35)),
-        hovertext=hov, hoverinfo="text", showlegend=False))
+        if meta["numbered"]:
+            tag_x.append(cx - r * 0.85); tag_y.append(cy - r * 0.85); tag_t.append(w)
+    fig = go.Figure()
+    for color, (xs, ys) in groups.items():
+        fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", fill="toself", fillcolor=color,
+                                 line=dict(color="white", width=1.2), hoverinfo="skip", showlegend=False))
+    fig.add_trace(go.Scatter(x=ring_x, y=ring_y, mode="lines", line=dict(color="#6B7280", width=1),
+                             hoverinfo="skip", showlegend=False))
+    if cross_x:
+        fig.add_trace(go.Scatter(x=cross_x, y=cross_y, mode="lines", line=dict(color="#111827", width=2.4),
+                                 hoverinfo="skip", showlegend=False))
+    if tag_t:
+        fig.add_trace(go.Scatter(x=tag_x, y=tag_y, mode="text", text=tag_t, textfont=dict(size=11, color=MUTED),
+                                 hoverinfo="skip", showlegend=False))
+    # transparent markers on top: they receive the drag selection and hover
+    fig.add_trace(go.Scatter(
+        x=hx, y=hy, mode="markers", marker=dict(size=size, color="rgba(0,0,0,0)"),
+        selected=dict(marker=dict(color="rgba(17,24,39,0.22)", opacity=1)),
+        unselected=dict(marker=dict(opacity=1)), hovertext=hov, hoverinfo="text", showlegend=False))
     fig.update_layout(
         height=int(rows * cell + 80), margin=dict(l=26, r=8, t=26, b=6), dragmode="select",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family=FONT, color=MUTED, size=12),
@@ -835,6 +889,34 @@ def layout_plate_figure(meta, wells, layout, color_fi, names):
                    tickvals=[] if meta["numbered"] else [i + 0.5 for i in range(rows)],
                    ticktext=[] if meta["numbered"] else [chr(65 + i) for i in range(rows)]))
     return fig
+
+
+def _wells_from_event(event, wells, meta, tol=0.15):
+    """Wells chosen by a drag. A box counts a well once it reaches within `tol` of the well's centre."""
+    picked = set(_selected_wells(event, wells))
+    try:
+        boxes = event["selection"]["box"]
+    except Exception:  # noqa: BLE001
+        boxes = []
+    for bx in boxes or []:
+        try:
+            x0, x1 = sorted(float(v) for v in bx["x"])
+            y0, y1 = sorted(float(v) for v in bx["y"])
+        except Exception:  # noqa: BLE001
+            continue
+        for w in wells:
+            i, j = _well_pos(w, meta)
+            cx, cy = j + 0.5, i + 0.5
+            if x0 - tol <= cx <= x1 + tol and y0 - tol <= cy <= y1 + tol:
+                picked.add(w)
+    return [w for w in wells if w in picked]
+
+
+def _clear_condition(fi):
+    ss = st.session_state
+    _push_undo()
+    ss["an_layout"][f"f{fi}"] = ""
+    _bump()
 
 
 def _expand_shape(sel, shape, wells, meta):
@@ -892,72 +974,99 @@ def _condition_card(fi, names):
     ss = st.session_state
     brush = ss.get("an_brush")
     with st.container(border=True):
-        v = st.text_input(f"Condition {fi + 1} name", value=ss["an_names"][fi], key=f"an_name_w{fi}",
-                          label_visibility="collapsed", placeholder=f"Condition {fi + 1}")
+        c_name, c_del = st.columns([5, 2], vertical_alignment="center")
+        v = c_name.text_input(f"Condition {fi + 1} name", value=ss["an_names"][fi], key=f"an_name_w{fi}",
+                              label_visibility="collapsed", placeholder=f"Condition {fi + 1}")
         ss["an_names"][fi] = v
+        c_del.button("Remove", key=f"an_rmc_{fi}", on_click=_delete_condition, args=(fi,),
+                     icon=":material/delete:", disabled=ss["an_nf"] <= 1,
+                     help="Remove this condition and its levels from the plate" if ss["an_nf"] > 1
+                     else "At least one condition is needed")
         levels = _ordered_levels(fi)
-        options = levels + [ERASE]
-        active = brush[1] if brush and brush[0] == fi else None
-        key = f"an_pill_{fi}_{hash((tuple(options), brush))}"
         if levels:
-            st.pills(f"Levels of {names[fi]}", options, selection_mode="single", default=active, key=key,
-                     label_visibility="collapsed", on_change=_pick_brush, args=(fi, key))
+            h1, h2, h3 = st.columns([0.8, 3.2, 1.1], vertical_alignment="center")
+            h2.caption("Level (click to paint with it)")
+            h3.caption("Control")
+            for lv in levels:
+                c1, c2, c3 = st.columns([0.8, 3.2, 1.1], vertical_alignment="center")
+                ss["an_colors"][(fi, lv)] = c1.color_picker(lv, value=_color(fi, lv), key=f"an_cp_{fi}_{lv}",
+                                                            label_visibility="collapsed")
+                c2.button(lv, key=f"an_lv_{fi}_{lv}", on_click=_set_brush, args=(fi, lv),
+                          type="primary" if brush == (fi, lv) else "secondary")
+                is_ctrl = ss["an_ctrl"].get(fi) == lv
+                c3.button("★" if is_ctrl else "☆", key=f"an_ct_{fi}_{lv}", on_click=_set_control, args=(fi, lv),
+                          help="Use as the control level when normalizing")
         else:
             st.caption("No levels yet. Type one below and press Enter.")
         nk = f"an_new_{fi}"
         st.text_input(f"New level for {names[fi]}", key=nk, label_visibility="collapsed",
                       placeholder="Add a level and press Enter", on_change=_add_level, args=(fi, nk))
-        with st.popover("Edit levels", icon=":material/tune:"):
+        b1, b2 = st.columns(2)
+        b1.button("Eraser", key=f"an_er_{fi}", on_click=_set_brush, args=(fi, ERASE), icon=":material/ink_eraser:",
+                  type="primary" if brush == (fi, ERASE) else "secondary", help="Paint over wells to remove this condition")
+        b2.button("Clear all", key=f"an_cl_{fi}", on_click=_clear_condition, args=(fi,),
+                  help=f"Remove {names[fi]} from every well (levels are kept)")
+        with st.popover("Rename, reorder or delete", icon=":material/tune:"):
             if not levels:
                 st.caption("Levels you add show up here.")
             for k, lv in enumerate(levels):
-                c1, c2, c3, c4, c5, c6 = st.columns([0.9, 3, 0.8, 0.8, 0.8, 0.8], vertical_alignment="center")
-                ss["an_colors"][(fi, lv)] = c1.color_picker(lv, value=_color(fi, lv), key=f"an_cp_{fi}_{lv}",
-                                                            label_visibility="collapsed")
+                c1, c2, c3, c4 = st.columns([3, 0.8, 0.8, 0.8], vertical_alignment="center")
                 rk = f"an_rn_{fi}_{lv}"
-                c2.text_input(f"Rename {lv}", value=lv, key=rk, label_visibility="collapsed",
+                c1.text_input(f"Rename {lv}", value=lv, key=rk, label_visibility="collapsed",
                               on_change=_rename_level, args=(fi, lv, rk))
-                c3.button("▲", key=f"an_up_{fi}_{lv}", on_click=_move_level, args=(fi, k, -1), disabled=k == 0,
+                c2.button("▲", key=f"an_up_{fi}_{lv}", on_click=_move_level, args=(fi, k, -1), disabled=k == 0,
                           help="Move up")
-                c4.button("▼", key=f"an_dn_{fi}_{lv}", on_click=_move_level, args=(fi, k, 1),
+                c3.button("▼", key=f"an_dn_{fi}_{lv}", on_click=_move_level, args=(fi, k, 1),
                           disabled=k == len(levels) - 1, help="Move down")
-                is_ctrl = ss["an_ctrl"].get(fi) == lv
-                c5.button("★" if is_ctrl else "☆", key=f"an_ct_{fi}_{lv}", on_click=_set_control, args=(fi, lv),
-                          help="Control level (used for normalizing)", type="primary" if is_ctrl else "secondary")
-                c6.button("✕", key=f"an_dl_{fi}_{lv}", on_click=_delete_level, args=(fi, lv),
-                          help="Delete level (its wells become unassigned)")
-            st.divider()
-            st.button(f"Delete condition '{names[fi]}'", key=f"an_delc_{fi}", on_click=_delete_condition,
-                      args=(fi,), disabled=ss["an_nf"] <= 1)
+                c4.button("✕", key=f"an_dl_{fi}_{lv}", on_click=_delete_level, args=(fi, lv),
+                          help="Delete this level (its wells become unassigned)")
 
 
 def _conditions_panel(names, nf):
-    ss = st.session_state
     st.markdown("**Conditions**")
     for fi in range(nf):
         _condition_card(fi, names)
     st.button("Add condition", on_click=_add_condition, disabled=nf >= MAX_F, key="an_add",
               icon=":material/add:")
-    brush = ss.get("an_brush")
-    if brush:
-        fi, lv = brush
-        st.caption(f"Painting {names[fi]}: {'erase' if lv == ERASE else lv}")
-    else:
-        st.caption("Pick a level above, then drag over wells on the plate to paint them.")
+
+
+def _plate_legend(names, nf, active):
+    ss = st.session_state
+    dot = ("<span style='display:inline-flex;align-items:center;gap:.3rem;margin-right:.8rem'>"
+           "<span style='width:12px;height:12px;border-radius:50%;background:{c};display:inline-block'></span>{t}</span>")
+    rows = []
+    for fi in active:
+        chips = "".join(dot.format(c=_color(fi, x), t=x) for x in _ordered_levels(fi))
+        rows.append(f"<div style='margin-bottom:.25rem'><b>{names[fi]}</b> &nbsp; {chips}</div>")
+    rows.append(dot.format(c="#F3F4F6;border:1px solid #9CA3AF", t="Unassigned")
+                + "<span style='display:inline-flex;align-items:center;gap:.3rem'>"
+                  "<span style='font-weight:700'>&#10005;</span> Excluded</span>")
+    note = ""
+    if len(active) > 1:
+        note = (f"<div style='color:{MUTED};margin-top:.3rem'>Each well is split into one wedge per condition, "
+                f"clockwise from the top: {', '.join(names[i] for i in active)}.</div>")
+    st.markdown(f"<div style='font-size:.85rem'>{''.join(rows)}{note}</div>", unsafe_allow_html=True)
 
 
 def _plate_panel(wells, meta, names, nf):
     ss = st.session_state
     layout = ss["an_layout"]
-    mode = _seg("Mode", ["Paint conditions", "Exclude wells"], "an_mode", label_visibility="collapsed")
-    shape = _seg("Brush shape", ["Wells", "Rows", "Columns"], "an_shape", label_visibility="collapsed")
+    m1, m2 = st.columns([1.25, 1.6])
+    m1.caption("Mode")
+    with m1:
+        mode = _seg("Mode", ["Paint conditions", "Exclude wells"], "an_mode", label_visibility="collapsed")
+    m2.caption("When you drag, select")
+    with m2:
+        shape_label = _seg("Drag selects", ["Wells", "Whole rows", "Whole columns"], "an_shape2",
+                           label_visibility="collapsed")
+    shape = {"Wells": "Wells", "Whole rows": "Rows", "Whole columns": "Columns"}[shape_label]
     brush = ss.get("an_brush")
     exclude_mode = mode == "Exclude wells"
     action = "Exclude"
     if exclude_mode:
         action = _seg("Action", ["Exclude", "Restore"], "an_exclact", label_visibility="collapsed")
         st.markdown(
-            f"<div style='background:var(--bg-warning,#FFF4D6);border-radius:8px;padding:8px 12px;font-size:.9rem'>"
+            f"<div style='background:rgba(255,193,7,.16);border-radius:8px;padding:8px 12px;font-size:.9rem'>"
             f"Drag over wells to {action.lower()} them. Excluded wells keep their conditions and are left out of "
             f"every chart and table.</div>", unsafe_allow_html=True)
     elif brush:
@@ -968,10 +1077,11 @@ def _plate_panel(wells, meta, names, nf):
             f"<div style='display:flex;align-items:center;gap:.6rem;background:rgba(0,114,178,.08);border-radius:8px;"
             f"padding:8px 12px;font-size:.95rem'><span style='width:14px;height:14px;border-radius:50%;"
             f"background:{dot};display:inline-block'></span><b>{label}</b>"
-            f"<span style='color:{MUTED}'>Drag or click wells to paint.</span></div>", unsafe_allow_html=True)
+            f"<span style='color:{MUTED}'>Drag or click wells to paint. Click the level again to stop.</span></div>",
+            unsafe_allow_html=True)
     else:
         st.markdown(f"<div style='background:rgba(128,128,128,.10);border-radius:8px;padding:8px 12px;"
-                    f"font-size:.95rem;color:{MUTED}'>Pick a level on the left, then drag over wells to paint "
+                    f"font-size:.95rem;color:{MUTED}'>Click a level on the left, then drag over wells to paint "
                     f"them.</div>", unsafe_allow_html=True)
 
     if ss.get("an_view", "Plate") == "Table":
@@ -991,13 +1101,12 @@ def _plate_panel(wells, meta, names, nf):
         _sync_levels()
         return
 
-    color_fi = brush[0] if (brush and not exclude_mode) else next(
-        (i for i in range(nf) if (layout[f"f{i}"] != "").any()), 0)
+    active = _active_conditions(nf)
     sel_key = f"an_plate_{ss['an_ver']}_{ss['an_gen']}"
-    event = st.plotly_chart(layout_plate_figure(meta, wells, layout, color_fi, names[:nf]), key=sel_key,
+    event = st.plotly_chart(layout_plate_figure(meta, wells, layout, names[:nf], active), key=sel_key,
                             on_select="rerun", selection_mode=("points", "box", "lasso"),
                             config={"displayModeBar": False})
-    sel = _expand_shape(_selected_wells(event, wells), shape, wells, meta)
+    sel = _expand_shape(_wells_from_event(event, wells, meta), shape, wells, meta)
     if sel:
         if exclude_mode:
             _push_undo()
@@ -1011,20 +1120,9 @@ def _plate_panel(wells, meta, names, nf):
             _bump()
             st.rerun(scope="fragment")
         else:
-            st.caption(f"{len(sel)} well(s) selected. Pick a level on the left to paint them.")
+            st.caption(f"{len(sel)} well(s) selected. Click a level on the left to paint them.")
 
-    lv = _ordered_levels(color_fi)
-    chips = "".join(
-        f"<span style='display:inline-flex;align-items:center;gap:.35rem;margin:0 .9rem .3rem 0'>"
-        f"<span style='width:12px;height:12px;border-radius:50%;background:{_color(color_fi, x)};"
-        f"display:inline-block'></span>{x}</span>" for x in lv)
-    chips += ("<span style='display:inline-flex;align-items:center;gap:.35rem;margin:0 .9rem .3rem 0'>"
-              "<span style='width:12px;height:12px;border-radius:50%;background:#F3F4F6;border:1px solid #9CA3AF;"
-              "display:inline-block'></span>Unassigned</span>"
-              "<span style='display:inline-flex;align-items:center;gap:.35rem;margin:0 .9rem .3rem 0'>"
-              "<span style='width:12px;height:12px;border-radius:50%;border:2px solid #111827;"
-              "display:inline-block;font-size:9px;line-height:8px;text-align:center'>x</span>Excluded</span>")
-    st.markdown(f"<div style='font-size:.85rem'><b>{names[color_fi]}</b> &nbsp; {chips}</div>", unsafe_allow_html=True)
+    _plate_legend(names, nf, active)
     excl = list(layout.index[layout["Excluded"]])
     if excl:
         st.caption(f"{len(excl)} excluded: {', '.join(excl[:12])}{'...' if len(excl) > 12 else ''}")
@@ -1185,7 +1283,7 @@ def bar_figure(s, g, x_levels, c_levels, x_color, c_color, err, ytitle, cname, h
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family=FONT, color=MUTED, size=13),
         legend=dict(title=dict(text=cname), orientation="h", y=1.08, x=0),
         xaxis=dict(tickvals=list(range(len(x_levels))), ticktext=x_levels,
-                   range=[-0.5 - max(0, (3 - len(x_levels)) * 0.6), len(x_levels) - 0.5 + max(0, (3 - len(x_levels)) * 0.6)],
+                   range=[-0.5 - max(0, (5 - len(x_levels)) / 2), len(x_levels) - 0.5 + max(0, (5 - len(x_levels)) / 2)],
                    showgrid=False, zeroline=False, fixedrange=True),
         yaxis=dict(title=ytitle, gridcolor="#EEF0F3", zeroline=False, rangemode="tozero", fixedrange=True),
         hoverlabel=dict(bgcolor="white", bordercolor=TRAY_EDGE, font=dict(family=FONT, color=INK, size=12)))
@@ -1250,9 +1348,9 @@ def _analysis_panel_body(raw, df, meta, base, names, nf, n_t, hours):
     ctrl = ss["an_ctrl"].get(xi)
     normalize = r1[4].checkbox("Normalize to control", value=False, key="an_norm", disabled=not ctrl,
                                help="Divides each value by the control level's mean (same color group, same time) "
-                                    "and shows % of control. Set the control level under Levels.")
+                                    "and shows % of control. Star a control level in the condition card.")
     if not ctrl:
-        r1[4].caption(f"Set a control level for {names[xi]} under Levels.")
+        r1[4].caption(f"Star a control level for {names[xi]} on the left.")
     normalize = bool(normalize and ctrl)
 
     closure = measure == "Scratch closure"
