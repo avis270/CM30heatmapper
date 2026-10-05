@@ -20,11 +20,13 @@ NODATA_FILL = "#E5E7EB"
 EMPTY_RING = "#C9CED6"
 RING = "rgba(17,24,39,0.25)"
 
-WELL_R = 0.42       # well radius in plate units (one well = 1 x 1)
+CELL = 100.0        # one well cell in SVG units
+WELL_R = 42.0       # well radius in SVG units
 GAP_HALF = 0.5      # half-width of the schematic scratch, as a fraction of the well radius
-HEAT_BINS = 48      # color steps used to draw the heatmap
 FULL_DRAW = 0.975   # closure above this is drawn as fully closed (no hairline gap)
-SPEEDS = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0}
+INTERVALS = {"0.5x": 1.0, "1x": 0.5, "2x": 0.25}   # seconds per timepoint while playing
+
+PLOT_L, PLOT_R = 44, 8   # time chart plot margins in px (the playhead marker is aligned to these)
 
 WELL_LINE = re.compile(r"^Well([A-Za-z]+\d+|\d+)$", re.I)
 
@@ -187,18 +189,19 @@ def closure_bundle(raw: bytes, full_closed_pct: float, cap: bool):
         "long_csv": long_df.to_csv(index=False).encode(),
         "wide_csv": wide_df.to_csv(index=False).encode(),
         "preview": long_df.head(200),
+        "wide_preview": wide_df.head(200),
         "n_bad": n_bad,
     }
 
 
 @st.cache_resource(show_spinner=False, max_entries=4)
-def confluency_csv(raw: bytes):
+def confluency_export(raw: bytes):
     df, _ = parse_cm30(raw)
     tidy = df.sort_values(["RowIdx", "ColIdx", "T_index"]).copy()
     tidy["Time"] = tidy["ReferenceTime"].dt.strftime("%Y-%m-%d %H:%M")
     tidy = tidy.rename(columns={"T_index": "Timepoint"})[
         ["Well", "Row", "Column", "Timepoint", "Time", "Elapsed_h", "Confluency"]]
-    return tidy.to_csv(index=False).encode()
+    return {"csv": tidy.to_csv(index=False).encode(), "preview": tidy.head(200)}
 
 
 # ---------------------------------------------------------------- colour helpers
@@ -216,293 +219,245 @@ def _css(rgb):
     return f"rgb({int(round(rgb[0]))},{int(round(rgb[1]))},{int(round(rgb[2]))})"
 
 
-def _text_on(rgb):
-    lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255
-    return INK if lum > 0.55 else "#FFFFFF"
-
-
-# ---------------------------------------------------------------- geometry helpers
-# Every well is drawn as a polygon inside a handful of shared traces (NaN separates polygons),
-# which keeps the browser's work small even for a 96-well plate.
-def _flat(X, Y):
-    pad = np.full((X.shape[0], 1), np.nan)
-    # 3 decimals is far below a pixel and cuts the data sent to the browser by about two thirds
-    return np.round(np.hstack([X, pad]).ravel(), 3), np.round(np.hstack([Y, pad]).ravel(), 3)
-
-
-def _circle_xy(cx, cy, r, n=40):
-    th = np.linspace(0, 2 * np.pi, n + 1)
-    return cx[:, None] + r * np.cos(th), cy[:, None] + r * np.sin(th)
-
-
-def _strip_xy(cx, cy, r, a, b, k=12):
-    """Polygons for the part of each circle between y offsets a and b from the well centre."""
-    pa = np.arcsin(np.clip(a / r, -1, 1))
-    pb = np.arcsin(np.clip(b / r, -1, 1))
-    s = np.linspace(0, 1, k)
-    ph_r = pa[:, None] + (pb - pa)[:, None] * s
-    ph_l = pb[:, None] + (pa - pb)[:, None] * s
-    xr, yr = cx[:, None] + r * np.cos(ph_r), cy[:, None] + r * np.sin(ph_r)
-    xl, yl = cx[:, None] - r * np.cos(ph_l), cy[:, None] + r * np.sin(ph_l)
-    return np.hstack([xr, xl, xr[:, :1]]), np.hstack([yr, yl, yr[:, :1]])
-
-
-def _rounded_rect_xy(x0, y0, x1, y1, rad, n=10):
-    pts_x, pts_y = [], []
-    for ccx, ccy, a0, a1 in [(x1 - rad, y0 + rad, -90, 0), (x1 - rad, y1 - rad, 0, 90),
-                             (x0 + rad, y1 - rad, 90, 180), (x0 + rad, y0 + rad, 180, 270)]:
-        th = np.radians(np.linspace(a0, a1, n))
-        pts_x.append(ccx + rad * np.cos(th))
-        pts_y.append(ccy + rad * np.sin(th))
-    x, y = np.concatenate(pts_x), np.concatenate(pts_y)
-    return np.append(x, x[0]), np.append(y, y[0])
-
-
-def _fill_trace(X, Y, color):
-    x, y = _flat(X, Y)
-    return go.Scatter(x=x, y=y, mode="lines", fill="toself", fillcolor=color, line=dict(width=0),
-                      hoverinfo="skip", showlegend=False)
-
-
-def _line_trace(X, Y, color, width=1, dash=None):
-    x, y = _flat(X, Y)
-    return go.Scatter(x=x, y=y, mode="lines", line=dict(color=color, width=width, dash=dash),
-                      hoverinfo="skip", showlegend=False)
-
-
-def _empty_positions(rows, cols, cx, cy):
-    taken = {(int(round(y - 0.5)), int(round(x - 0.5))) for x, y in zip(cx, cy)}
-    pos = [(i, j) for i in range(rows) for j in range(cols) if (i, j) not in taken]
-    if not pos:
-        return np.array([]), np.array([])
-    arr = np.array(pos, dtype=float)
-    return arr[:, 1] + 0.5, arr[:, 0] + 0.5
-
-
-def _canvas(rows, cols, numbered, x_pad):
-    cell = min(130.0, 900.0 / (cols + x_pad))
-    left = 0.1 if numbered else 0.45
-    fig = go.Figure()
-    fig.update_layout(
-        height=int(rows * cell + 120),
-        margin=dict(l=8 if numbered else 30, r=8, t=34, b=8),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(family=FONT, color=MUTED, size=13),
-        showlegend=False,
-        dragmode=False,
-        hoverlabel=dict(bgcolor="white", bordercolor=TRAY_EDGE, font=dict(family=FONT, color=INK, size=13)),
-        xaxis=dict(
-            range=[-left, cols + x_pad], side="top", showgrid=False, zeroline=False, showline=False,
-            ticks="", fixedrange=True, constrain="domain",
-            tickvals=[] if numbered else [j + 0.5 for j in range(cols)],
-            ticktext=[] if numbered else [str(j + 1) for j in range(cols)],
-        ),
-        yaxis=dict(
-            range=[rows + 0.1, -0.1], scaleanchor="x", scaleratio=1, showgrid=False, zeroline=False,
-            showline=False, ticks="", fixedrange=True, constrain="domain",
-            tickvals=[] if numbered else [i + 0.5 for i in range(rows)],
-            ticktext=[] if numbered else [chr(65 + i) for i in range(rows)],
-        ),
-    )
-    tx, ty = _rounded_rect_xy(0, 0, cols, rows, 0.28)
-    fig.add_trace(go.Scatter(x=tx, y=ty, mode="lines", fill="toself", fillcolor=TRAY,
-                             line=dict(color=TRAY_EDGE, width=1), hoverinfo="skip", showlegend=False))
-    return fig, cell
-
-
-def _well_numbers(fig, meta):
-    if not meta["numbered"]:
-        return
-    rows, cols = meta["rows"], meta["cols"]
-    n = np.arange(rows * cols)
-    fig.add_trace(go.Scatter(
-        x=(n % cols) + 0.5 - WELL_R * 0.78, y=(n // cols) + 0.5 - WELL_R * 0.78, mode="text",
-        text=[str(k + 1) for k in n], textfont=dict(size=11, color=MUTED, family=FONT),
-        hoverinfo="skip", showlegend=False))
-
-
-def _hover_layer(fig, cx, cy, size, hovertext, text=None, text_colors=None, fs=13):
-    fig.add_trace(go.Scatter(
-        x=cx, y=cy, mode="markers+text" if text is not None else "markers",
-        marker=dict(size=size, color="rgba(0,0,0,0)"),
-        text=text, textfont=dict(size=fs, family=FONT, color=text_colors) if text is not None else None,
-        textposition="middle center", hovertext=hovertext, hoverinfo="text", showlegend=False))
-
-
-# ---------------------------------------------------------------- figures
-def heatmap_figure(sl, meta, vmin, vmax, c0, c1, show_values=True):
-    rows, cols = meta["rows"], meta["cols"]
-    fig, cell = _canvas(rows, cols, meta["numbered"], 1.3)
-    r = WELL_R
-    s = sl.dropna(subset=["Confluency"])
-    cx = s["ColIdx"].to_numpy(float) + 0.5
-    cy = s["RowIdx"].to_numpy(float) + 0.5
-    v = s["Confluency"].to_numpy(float)
-
-    ex, ey = _empty_positions(rows, cols, cx, cy)
-    if len(ex):
-        fig.add_trace(_line_trace(*_circle_xy(ex, ey, r), EMPTY_RING, 1, "dot"))
-
-    t = np.clip((v - vmin) / max(vmax - vmin, 1e-9), 0, 1)
-    bins = np.rint(t * (HEAT_BINS - 1)).astype(int)
-    colors = {k: lerp_color(c0, c1, k / (HEAT_BINS - 1)) for k in np.unique(bins)}
-    for k in colors:
-        sel = bins == k
-        fig.add_trace(_fill_trace(*_circle_xy(cx[sel], cy[sel], r), _css(colors[k])))
-    if len(cx):
-        fig.add_trace(_line_trace(*_circle_xy(cx, cy, r), RING, 1))
-
-    _well_numbers(fig, meta)
-    fmt = ".1f" if cols <= 6 else ".0f"
-    fs = int(max(9, min(16, cell * 0.17)))
-    _hover_layer(
-        fig, cx, cy, min(cell * 0.8, 100),
-        [f"<b>Well {w}</b><br>Confluency {val:.1f}%" for w, val in zip(s["Well"], v)],
-        [f"{val:{fmt}}%" for val in v] if show_values else None,
-        [_text_on(colors[k]) for k in bins], fs)
-
-    # scale bar, drawn in plate coordinates so it hugs the plate at any window width
-    xb, y_top, y_bot = cols + 0.3, 0.4, rows - 0.4
-    zvals = np.linspace(vmax, vmin, 60)
-    fig.add_trace(go.Heatmap(
-        x=[xb - 0.04, xb + 0.04], y=np.linspace(y_top, y_bot, 60), z=np.column_stack([zvals, zvals]),
-        colorscale=[[0, c0], [1, c1]], zmin=vmin, zmax=vmax, showscale=False, hoverinfo="skip",
-        xgap=0, ygap=0))
-    ticks = np.linspace(vmin, vmax, 5)
-    fig.add_trace(go.Scatter(
-        x=[xb + 0.14] * 5, y=y_top + (vmax - ticks) / (vmax - vmin) * (y_bot - y_top), mode="text",
-        text=[f"{x:g}" for x in ticks], textposition="middle right",
-        textfont=dict(size=12, color=MUTED, family=FONT), hoverinfo="skip", showlegend=False))
-    fig.add_trace(go.Scatter(
-        x=[xb - 0.08], y=[y_top - 0.22], mode="text", text=["% confluency"], textposition="middle right",
-        textfont=dict(size=12, color=MUTED, family=FONT), hoverinfo="skip", showlegend=False))
-    return fig
-
-
-def scratch_figure(sl, meta, c_start, c_mig, show_values=True):
-    rows, cols = meta["rows"], meta["cols"]
-    fig, cell = _canvas(rows, cols, meta["numbered"], 1.9)
-    r = WELL_R
-    cx_all = sl["ColIdx"].to_numpy(float) + 0.5
-    cy_all = sl["RowIdx"].to_numpy(float) + 0.5
-    cl_all = sl["Closure_pct"].to_numpy(float) / 100
-    ok = ~np.isnan(cl_all)
-
-    ex, ey = _empty_positions(rows, cols, cx_all, cy_all)
-    if len(ex):
-        fig.add_trace(_line_trace(*_circle_xy(ex, ey, r), EMPTY_RING, 1, "dot"))
-
-    # layer 1: open gap (white disc under everything), and wells with no closure value
-    fig.add_trace(_fill_trace(*_circle_xy(cx_all, cy_all, r), GAP_FILL))
-    if (~ok).any():
-        fig.add_trace(_fill_trace(*_circle_xy(cx_all[~ok], cy_all[~ok], r), NODATA_FILL))
-
-    cx, cy, c = cx_all[ok], cy_all[ok], np.clip(cl_all[ok], 0, 1)
-    half0 = GAP_HALF * r
-    gh = half0 * (1 - c)                       # half-width of the gap that is still open
-    eps = 0.02 * r                             # overlap hides the seam between the two colors
-
-    # layer 2: migrated cells grow from the original cell fronts toward the middle of the gap
-    m = c > 0.002
-    full = c > FULL_DRAW
-    if m.any():
-        top_b = np.where(full, half0 + eps, -gh)[m]
-        Xt, Yt = _strip_xy(cx[m], cy[m], r, np.full(m.sum(), -half0 - eps), top_b)
-        bm = m & ~full
-        Xb, Yb = _strip_xy(cx[bm], cy[bm], r, gh[bm], np.full(bm.sum(), half0 + eps))
-        mig = [np.vstack([Xt, Xb]), np.vstack([Yt, Yb])]
-        fig.add_trace(_fill_trace(mig[0], mig[1], c_mig))
-
-    # layer 3: starting cells (the untouched monolayer) above and below the original scratch
-    if len(cx):
-        n = len(cx)
-        Xs1, Ys1 = _strip_xy(cx, cy, r, np.full(n, -r), np.full(n, -half0))
-        Xs2, Ys2 = _strip_xy(cx, cy, r, np.full(n, half0), np.full(n, r))
-        fig.add_trace(_fill_trace(np.vstack([Xs1, Xs2]), np.vstack([Ys1, Ys2]), c_start))
-        fig.add_trace(_line_trace(*_circle_xy(cx_all, cy_all, r), RING, 1))
-
-    _well_numbers(fig, meta)
-
-    # label pills and hover layer
-    fmt = ".1f" if cols <= 6 else ".0f"
-    fs = int(max(9, min(15, cell * 0.16)))
-    chars = 6 if cols <= 6 else 4
-    pw, ph = (chars * fs * 0.6 + 10) / cell, fs * 1.5 / cell
-    if show_values and len(cx):
-        tx, ty = _rounded_rect_xy(-pw / 2, -ph / 2, pw / 2, ph / 2, ph / 2, 6)
-        fig.add_trace(_fill_trace(cx[:, None] + tx, cy[:, None] + ty, "rgba(255,255,255,0.9)"))
-
-    labels, hover = [], []
-    for w, cl, conf, c0v, good in zip(sl["Well"], cl_all, sl["Confluency"], sl["Confluency_T0"], ok):
-        if good:
-            labels.append(f"{cl * 100:{fmt}}%")
-            hover.append(f"<b>Well {w}</b><br>Closure {cl * 100:.1f}%<br>Confluency {conf:.1f}% (start {c0v:.1f}%)")
-        else:
-            labels.append("")
-            hover.append(f"<b>Well {w}</b><br>Closure unavailable<br>Starts at {c0v:.1f}% confluency")
-    _hover_layer(fig, cx_all, cy_all, min(cell * 0.8, 100), hover, labels if show_values else None, INK, fs)
-
-    # key, drawn next to the plate
-    kx, ky = cols + 0.3, rows / 2 + np.array([-0.4, 0.0, 0.4])
-    fig.add_trace(go.Scatter(
-        x=[kx] * 3, y=ky, mode="markers+text", text=["Starting cells", "Migrated", "Open gap"],
-        textposition="middle right", textfont=dict(size=12, color=MUTED, family=FONT),
-        marker=dict(symbol="square", size=14, color=[c_start, c_mig, GAP_FILL],
-                    line=dict(width=1, color="rgba(17,24,39,0.3)")),
-        hoverinfo="skip", showlegend=False))
-    return fig
-
-
-PLOT_CONFIG = {
-    "displaylogo": False,
-    "displayModeBar": "hover",
-    "modeBarButtonsToRemove": ["zoom2d", "pan2d", "select2d", "lasso2d", "zoomIn2d", "zoomOut2d",
-                               "autoScale2d", "resetScale2d"],
-    "toImageButtonOptions": {"format": "png", "scale": 3, "filename": "plate"},
-}
-
-
-# ---------------------------------------------------------------- time chart (also the scrubber)
 def _rgba(hex_color, alpha):
     r, g, b = _rgb(hex_color)
     return f"rgba({r},{g},{b},{alpha})"
 
 
-def time_chart(hours, values, t, color):
-    """Plate-average curve with a marker at the current timepoint. Clicking anywhere selects a timepoint."""
+def _text_on(rgb):
+    lum = (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) / 255
+    return INK if lum > 0.55 else "#FFFFFF"
+
+
+# ---------------------------------------------------------------- plate drawing (inline SVG)
+# The plate is drawn as one SVG string. Streamlit updates it in place, so playback does not flash,
+# it scales to any window width, and the same drawing can be downloaded as a vector file.
+SVG_FONT = "Source Sans Pro, Inter, Arial, sans-serif"
+
+
+def _well_label(i, j, meta):
+    return str(i * meta["cols"] + j + 1) if meta["numbered"] else f"{chr(65 + i)}{j + 1}"
+
+
+def _plate_dims(meta, legend_w):
+    left = 0 if meta["numbered"] else 46
+    top = 40
+    pw, ph = meta["cols"] * CELL, meta["rows"] * CELL
+    return left, top, pw, ph, left + pw + legend_w + 10, top + ph + 14
+
+
+def _tray_and_labels(meta, left, top, pw, ph):
+    rows, cols = meta["rows"], meta["cols"]
+    out = [f'<rect x="{left}" y="{top}" width="{pw:.0f}" height="{ph:.0f}" rx="28" fill="{TRAY}" '
+           f'stroke="{TRAY_EDGE}" stroke-width="1.5"/>']
+    if not meta["numbered"]:
+        for j in range(cols):
+            out.append(f'<text x="{left + j * CELL + CELL / 2:.1f}" y="{top - 16}" text-anchor="middle" '
+                       f'font-size="16" fill="{MUTED}">{j + 1}</text>')
+        for i in range(rows):
+            out.append(f'<text x="{left - 16}" y="{top + i * CELL + CELL / 2:.1f}" text-anchor="end" dy=".35em" '
+                       f'font-size="16" fill="{MUTED}">{chr(65 + i)}</text>')
+    return "".join(out)
+
+
+def _empty_well(cx, cy):
+    return (f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{WELL_R}" fill="none" stroke="{EMPTY_RING}" '
+            f'stroke-width="1.5" stroke-dasharray="3 5"/>')
+
+
+def _number_tag(cx, cy, label):
+    return (f'<text x="{cx - WELL_R * 0.8:.1f}" y="{cy - WELL_R * 0.8:.1f}" text-anchor="middle" font-size="14" '
+            f'fill="{MUTED}">{label}</text>')
+
+
+def _tip_svg(uid, k, cx, cy, lines, on_right, bound_w):
+    tw = max(len(s) for s in lines) * 8.4 + 24
+    th = len(lines) * 22 + 14
+    x = cx + WELL_R + 10 if on_right else cx - WELL_R - 10 - tw
+    x = min(max(x, 2), bound_w - tw - 2)
+    y = cy - th / 2
+    rows_svg = "".join(
+        f'<text x="{x + 12:.1f}" y="{y + 25 + n * 22:.1f}" font-size="15" fill="{INK}" '
+        f'{"font-weight=" + chr(34) + "700" + chr(34) if n == 0 else ""}>{s}</text>'
+        for n, s in enumerate(lines))
+    return (f'<g class="tip {uid}t{k}"><rect x="{x:.1f}" y="{y:.1f}" width="{tw:.1f}" height="{th}" rx="8" '
+            f'fill="white" stroke="{TRAY_EDGE}" stroke-width="1.5"/>{rows_svg}</g>')
+
+
+def _svg_frame(uid, W, H, body, tips, n_tips, responsive):
+    css = ""
+    if responsive:
+        css = (f".{uid} .tip{{display:none;pointer-events:none}}"
+               f".{uid} .w:hover .ring{{stroke:{INK};stroke-width:3}}"
+               + "".join(f".{uid}:has(.{uid}w{k}:hover) .{uid}t{k}{{display:block}}" for k in range(n_tips)))
+        size = (f'viewBox="0 0 {W:.0f} {H:.0f}" '
+                f'style="width:100%;max-width:{int(W * 1.25)}px;height:auto;display:block;margin:0 auto"')
+        bg, tips_svg = "", tips
+    else:
+        size = f'width="{W:.0f}" height="{H:.0f}" viewBox="0 0 {W:.0f} {H:.0f}"'
+        bg, tips_svg = f'<rect width="{W:.0f}" height="{H:.0f}" fill="white"/>', ""
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" class="pv {uid}" font-family="{SVG_FONT}" {size}>'
+            f'<style>{css}</style>{bg}{body}{tips_svg}</svg>')
+
+
+def heatmap_svg(sl, meta, vmin, vmax, c0, c1, show_values, responsive=True):
+    rows, cols = meta["rows"], meta["cols"]
+    uid = "h"
+    left, top, pw, ph, W, H = _plate_dims(meta, 150)
+    s = sl.dropna(subset=["Confluency"])
+    vals = {w: v for w, v in zip(s["Well"], s["Confluency"])}
+    fmt = ".1f" if cols <= 6 else ".0f"
+    fs = 21 if cols <= 6 else 18 if cols <= 12 else 15
+
+    body = [_tray_and_labels(meta, left, top, pw, ph)]
+    tips, k = [], 0
+    for i in range(rows):
+        for j in range(cols):
+            cx, cy = left + j * CELL + CELL / 2, top + i * CELL + CELL / 2
+            well = _well_label(i, j, meta)
+            if meta["numbered"]:
+                body.append(_number_tag(cx, cy, well))
+            v = vals.get(well)
+            if v is None:
+                body.append(_empty_well(cx, cy))
+                continue
+            t = float(np.clip((v - vmin) / max(vmax - vmin, 1e-9), 0, 1))
+            rgb = lerp_color(c0, c1, t)
+            label = (f'<text x="{cx:.1f}" y="{cy:.1f}" text-anchor="middle" dy=".35em" font-size="{fs}" '
+                     f'fill="{_text_on(rgb)}">{v:{fmt}}%</text>') if show_values else ""
+            body.append(
+                f'<g class="w {uid}w{k}"><circle class="ring" cx="{cx:.1f}" cy="{cy:.1f}" r="{WELL_R}" '
+                f'fill="{_css(rgb)}" stroke="rgba(17,24,39,.25)" stroke-width="1.5"/>{label}'
+                f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{WELL_R}" fill="transparent"/></g>')
+            tips.append(_tip_svg(uid, k, cx, cy, [f"Well {well}", f"Confluency {v:.1f}%"], j < cols / 2, W))
+            k += 1
+
+    # scale bar next to the plate
+    x0, y0, bh = left + pw + 30, top + 24, ph - 48
+    body.append(f'<defs><linearGradient id="{uid}g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" '
+                f'stop-color="{c1}"/><stop offset="1" stop-color="{c0}"/></linearGradient></defs>')
+    body.append(f'<rect x="{x0}" y="{y0}" width="18" height="{bh}" rx="3" fill="url(#{uid}g)" '
+                f'stroke="{TRAY_EDGE}"/>')
+    body.append(f'<text x="{x0 - 2}" y="{y0 - 12}" font-size="14" fill="{MUTED}">% confluency</text>')
+    for tick in np.linspace(vmin, vmax, 5):
+        ty = y0 + (vmax - tick) / (vmax - vmin) * bh
+        body.append(f'<text x="{x0 + 28}" y="{ty:.1f}" dy=".35em" font-size="14" fill="{MUTED}">{tick:g}</text>')
+    return _svg_frame(uid, W, H, "".join(body), "".join(tips), k, responsive)
+
+
+def scratch_svg(sl, meta, c_start, c_mig, show_values, responsive=True):
+    rows, cols = meta["rows"], meta["cols"]
+    uid = "s"
+    left, top, pw, ph, W, H = _plate_dims(meta, 180)
+    by_well = sl.set_index("Well")
+    fmt = ".1f" if cols <= 6 else ".0f"
+    fs = 20 if cols <= 6 else 17 if cols <= 12 else 14
+    half0 = GAP_HALF * WELL_R
+    eps = 0.04 * WELL_R
+
+    body = [_tray_and_labels(meta, left, top, pw, ph)]
+    defs, tips, k = [], [], 0
+    for i in range(rows):
+        for j in range(cols):
+            cx, cy = left + j * CELL + CELL / 2, top + i * CELL + CELL / 2
+            well = _well_label(i, j, meta)
+            if meta["numbered"]:
+                body.append(_number_tag(cx, cy, well))
+            if well not in by_well.index:
+                body.append(_empty_well(cx, cy))
+                continue
+            row = by_well.loc[well]
+            cl, conf, c0v = row["Closure_pct"], row["Confluency"], row["Confluency_T0"]
+            circle = f'cx="{cx:.1f}" cy="{cy:.1f}" r="{WELL_R}"'
+            hit = f'<circle {circle} fill="transparent"/>'
+            if pd.isna(cl):
+                body.append(f'<g class="w {uid}w{k}"><circle class="ring" {circle} fill="{NODATA_FILL}" '
+                            f'stroke="{EMPTY_RING}" stroke-width="1.5"/>{hit}</g>')
+                tips.append(_tip_svg(uid, k, cx, cy, [f"Well {well}", "Closure unavailable",
+                                                      f"Starts at {c0v:.1f}% confluency"], j < cols / 2, W))
+                k += 1
+                continue
+            c = float(np.clip(cl / 100, 0, 1))
+            gh = half0 * (1 - c)                     # half-width of the gap that is still open
+            full = c > FULL_DRAW
+            defs.append(f'<clipPath id="{uid}c{k}"><circle {circle}/></clipPath>')
+            x, w = cx - WELL_R, 2 * WELL_R
+            mig = ""
+            if c > 0.002:
+                if full:
+                    mig = f'<rect x="{x:.1f}" y="{cy - half0 - eps:.1f}" width="{w}" height="{2 * (half0 + eps):.1f}" fill="{c_mig}"/>'
+                else:
+                    hh = half0 + eps - gh
+                    mig = (f'<rect x="{x:.1f}" y="{cy - half0 - eps:.1f}" width="{w}" height="{hh:.1f}" fill="{c_mig}"/>'
+                           f'<rect x="{x:.1f}" y="{cy + gh:.1f}" width="{w}" height="{hh:.1f}" fill="{c_mig}"/>')
+            start = (f'<rect x="{x:.1f}" y="{cy - WELL_R:.1f}" width="{w}" height="{WELL_R - half0:.1f}" fill="{c_start}"/>'
+                     f'<rect x="{x:.1f}" y="{cy + half0:.1f}" width="{w}" height="{WELL_R - half0:.1f}" fill="{c_start}"/>')
+            pill = ""
+            if show_values:
+                txt = f"{cl:{fmt}}%"
+                pwid, phei = len(txt) * fs * 0.58 + 18, fs * 1.7
+                pill = (f'<rect x="{cx - pwid / 2:.1f}" y="{cy - phei / 2:.1f}" width="{pwid:.1f}" height="{phei:.1f}" '
+                        f'rx="{phei / 2:.1f}" fill="rgba(255,255,255,.92)"/>'
+                        f'<text x="{cx:.1f}" y="{cy:.1f}" text-anchor="middle" dy=".35em" font-size="{fs}" '
+                        f'fill="{INK}">{txt}</text>')
+            body.append(
+                f'<g class="w {uid}w{k}"><circle {circle} fill="{GAP_FILL}"/>'
+                f'<g clip-path="url(#{uid}c{k})">{mig}{start}</g>'
+                f'<circle class="ring" {circle} fill="none" stroke="rgba(17,24,39,.28)" stroke-width="1.5"/>'
+                f'{pill}{hit}</g>')
+            tips.append(_tip_svg(uid, k, cx, cy, [f"Well {well}", f"Closure {cl:.1f}%",
+                                                  f"Confluency {conf:.1f}% (start {c0v:.1f}%)"], j < cols / 2, W))
+            k += 1
+
+    # key next to the plate
+    kx, ky = left + pw + 30, top + ph / 2
+    for n, (name, color, stroke) in enumerate([("Starting cells", c_start, "none"), ("Migrated", c_mig, "none"),
+                                                ("Open gap", GAP_FILL, EMPTY_RING)]):
+        yy = ky + (n - 1) * 36
+        body.append(f'<rect x="{kx}" y="{yy - 9:.1f}" width="18" height="18" rx="3" fill="{color}" '
+                    f'stroke="{stroke if stroke != "none" else "rgba(17,24,39,.2)"}"/>')
+        body.append(f'<text x="{kx + 28}" y="{yy:.1f}" dy=".35em" font-size="15" fill="{MUTED}">{name}</text>')
+    return _svg_frame(uid, W, H, f'<defs>{"".join(defs)}</defs>' + "".join(body), "".join(tips), k, responsive)
+
+
+# ---------------------------------------------------------------- time chart (also the scrubber)
+def time_chart(hours, values, color):
+    """Plate-average curve. Static (the marker is drawn separately) so it never redraws during playback."""
     hours = np.asarray(hours, float)
     values = np.asarray(values, float)
     n = len(hours)
-    now = hours[t - 1]
-    dx = float(np.median(np.diff(hours))) if n > 1 else 1.0
-
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=hours, y=values, mode="lines", line=dict(color=color, width=2), fill="tozeroy",
-        fillcolor=_rgba(color, 0.16), showlegend=False,
-        hovertemplate="%{x:.1f} h, %{y:.1f}%<extra></extra>"))
-    # invisible full-height bars make the whole chart area clickable
-    fig.add_trace(go.Bar(
-        x=hours, y=np.full(n, 100.0), width=dx, customdata=np.arange(1, n + 1),
-        marker=dict(color="rgba(0,0,0,0)"), selected=dict(marker=dict(opacity=0)),
-        unselected=dict(marker=dict(opacity=0)), hoverinfo="none", showlegend=False))
-    fig.add_shape(type="line", x0=now, x1=now, y0=0, y1=100, line=dict(color=INK, width=1.2, dash="dot"))
+        fillcolor=_rgba(color, 0.16), hoverinfo="skip", showlegend=False))
+    # invisible markers on the curve are the click targets; the nearest one wins wherever you click
     fig.add_trace(go.Scatter(
-        x=[now], y=[0], mode="markers", cliponaxis=False, hoverinfo="skip", showlegend=False,
-        marker=dict(size=13, color=INK, line=dict(color="white", width=2))))
+        x=hours, y=values, mode="markers", customdata=np.arange(1, n + 1),
+        marker=dict(size=14, color="rgba(0,0,0,0)"), selected=dict(marker=dict(opacity=0)),
+        unselected=dict(marker=dict(opacity=0)), hovertemplate="%{x:.1f} h, %{y:.1f}%<extra></extra>",
+        showlegend=False))
     fig.update_layout(
-        height=150, margin=dict(l=44, r=8, t=8, b=40), bargap=0, hovermode="x", showlegend=False,
-        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        height=108, margin=dict(l=PLOT_L, r=PLOT_R, t=10, b=26), hovermode="closest", hoverdistance=-1,
+        showlegend=False, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family=FONT, color=MUTED, size=12),
         hoverlabel=dict(bgcolor="white", bordercolor=TRAY_EDGE, font=dict(family=FONT, color=INK, size=12)),
-        xaxis=dict(range=[hours[0], hours[-1]], title=dict(text="Elapsed hours", standoff=6), fixedrange=True,
-                   showgrid=False, zeroline=False, showline=True, linecolor=TRAY_EDGE, ticks="outside",
-                   tickcolor=TRAY_EDGE),
-        yaxis=dict(range=[0, 100], tickvals=[0, 50, 100], fixedrange=True, gridcolor="#EEF0F3", zeroline=False,
-                   showline=False, ticks=""),
+        xaxis=dict(range=[hours[0], hours[-1]], ticksuffix=" h", fixedrange=True, showgrid=False,
+                   zeroline=False, showline=True, linecolor=TRAY_EDGE, ticks="outside", tickcolor=TRAY_EDGE),
+        yaxis=dict(range=[0, 100], tickvals=[0, 50, 100], fixedrange=True, gridcolor="#EEF0F3",
+                   zeroline=False, showline=False, ticks=""),
     )
     return fig
+
+
+def _playhead_html(hours, t):
+    """Marker that sits above the chart at the current time. Plain HTML, so it moves without a redraw."""
+    hours = np.asarray(hours, float)
+    span = max(hours[-1] - hours[0], 1e-9)
+    pct = (hours[t - 1] - hours[0]) / span * 100
+    return (f"<div style='margin:0 {PLOT_R}px -0.9rem {PLOT_L}px;position:relative;height:14px'>"
+            f"<div style='position:absolute;left:{pct:.2f}%;top:0;transform:translateX(-50%);width:0;height:0;"
+            f"border-left:8px solid transparent;border-right:8px solid transparent;border-top:12px solid {INK}'>"
+            f"</div></div>")
 
 
 def _t_from_points(points, hours, n_t):
@@ -540,13 +495,13 @@ def _header_html(t, n_t, elapsed, ref):
 
 def _speed_control(container, key):
     if hasattr(st, "segmented_control"):
-        container.segmented_control("Speed", list(SPEEDS), default="1x", key=key, label_visibility="collapsed")
+        container.segmented_control("Speed", list(INTERVALS), default="1x", key=key, label_visibility="collapsed")
     else:
-        container.radio("Speed", list(SPEEDS), key=key, horizontal=True, label_visibility="collapsed")
+        container.radio("Speed", list(INTERVALS), key=key, horizontal=True, label_visibility="collapsed")
 
 
-def _player(prefix, n_t, df, meta, figure_fn, series, chart_color, used_speed):
-    """Player row, header, plate, footnote and time chart. Runs as a fragment so ticks only redraw this block."""
+def _player(prefix, n_t, df, meta, svg_fn, series, chart_color, used_speed, base):
+    """Controls, time chart, header, plate and footnote. Runs as a fragment so ticks only redraw this block."""
     tkey, pkey, skey, gkey = f"{prefix}_t", f"{prefix}_play", f"{prefix}_speed", f"{prefix}_gen"
     st.session_state.setdefault(tkey, 1)
     st.session_state.setdefault(pkey, False)
@@ -561,7 +516,7 @@ def _player(prefix, n_t, df, meta, figure_fn, series, chart_color, used_speed):
             st.session_state[tkey] += 1
 
     if n_t > 1:
-        c_play, c_prev, c_next, c_speed, _ = st.columns([1, 0.5, 0.5, 2.4, 4], vertical_alignment="center")
+        c_play, c_prev, c_next, c_speed, c_hint = st.columns([1, 0.5, 0.5, 2.4, 3.2], vertical_alignment="center")
         playing = st.session_state[pkey]
         if c_play.button("Pause" if playing else "Play", key=f"{prefix}_btn"):
             if playing:
@@ -578,21 +533,15 @@ def _player(prefix, n_t, df, meta, figure_fn, series, chart_color, used_speed):
         _speed_control(c_speed, skey)
         if (st.session_state.get(skey) or "1x") != used_speed:
             st.rerun()
+        c_hint.markdown(f"<div style='text-align:right;font-size:0.85rem;color:{FAINT}'>"
+                        "Click the chart to jump to a time</div>", unsafe_allow_html=True)
 
     t = int(min(max(st.session_state[tkey], 1), n_t))
-    sl = df[df["T_index"] == t]
-    ref, elapsed = sl["ReferenceTime"].iloc[0], sl["Elapsed_h"].iloc[0]
-    st.markdown(_header_html(t, n_t, elapsed, ref), unsafe_allow_html=True)
-    st.plotly_chart(figure_fn(sl), config=PLOT_CONFIG, key=f"{prefix}_plot")
-    st.markdown(
-        f"<div style='text-align:right;font-size:0.75rem;color:{FAINT}'>"
-        f"{meta['project']}: {meta['vessel']}, {ref:%Y-%m-%d %H:%M}, {elapsed:.1f} h</div>",
-        unsafe_allow_html=True)
 
     if n_t > 1:
-        st.caption("Plate average over time. Click the chart to jump to a timepoint.")
+        st.markdown(_playhead_html(hours, t), unsafe_allow_html=True)
         event = st.plotly_chart(
-            time_chart(hours, values, t, chart_color), config={"displayModeBar": False},
+            time_chart(hours, values, chart_color), config={"displayModeBar": False},
             key=f"{prefix}_tc_{st.session_state[gkey]}", on_select="rerun", selection_mode="points")
         points = (event or {}).get("selection", {}).get("points", []) if event else []
         new_t = _t_from_points(points, hours, n_t)
@@ -604,13 +553,27 @@ def _player(prefix, n_t, df, meta, figure_fn, series, chart_color, used_speed):
             except Exception:
                 st.rerun()
 
+    sl = df[df["T_index"] == t]
+    ref, elapsed = sl["ReferenceTime"].iloc[0], sl["Elapsed_h"].iloc[0]
+    st.markdown(_header_html(t, n_t, elapsed, ref), unsafe_allow_html=True)
+    st.markdown(svg_fn(sl, True), unsafe_allow_html=True)
+    c_dl, c_note = st.columns([1.3, 3], vertical_alignment="center")
+    playing_now = st.session_state[pkey]
+    c_dl.download_button("Download this view (SVG)", b"" if playing_now else svg_fn(sl, False).encode(),
+                         f"{base}_{prefix}_T{t:02d}.svg", "image/svg+xml", key=f"{prefix}_svgdl",
+                         disabled=playing_now)
+    c_note.markdown(
+        f"<div style='text-align:right;font-size:0.75rem;color:{FAINT}'>"
+        f"{meta['project']}: {meta['vessel']}, {ref:%Y-%m-%d %H:%M}, {elapsed:.1f} h</div>",
+        unsafe_allow_html=True)
 
-def run_player(prefix, n_t, df, meta, figure_fn, series, chart_color):
+
+def run_player(prefix, n_t, df, meta, svg_fn, series, chart_color, base):
     playing = st.session_state.get(f"{prefix}_play", False)
     speed_label = st.session_state.get(f"{prefix}_speed") or "1x"
-    interval = 1.0 / SPEEDS[speed_label]
+    interval = INTERVALS[speed_label]
     frag = st.fragment(run_every=interval if playing else None)(_player)
-    frag(prefix, n_t, df, meta, figure_fn, series, chart_color, speed_label)
+    frag(prefix, n_t, df, meta, svg_fn, series, chart_color, speed_label, base)
 
 
 def _chart_color(hex_color):
@@ -618,9 +581,19 @@ def _chart_color(hex_color):
     return hex_color if (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.85 else MUTED
 
 
+TAB_CSS = """<style>
+[data-testid="stTab"], button[data-baseweb="tab"] {padding: 0.65rem 1.6rem !important;}
+[data-testid="stTab"] p, button[data-baseweb="tab"] p {font-size: 1.2rem !important; font-weight: 700 !important;}
+[data-testid="stTab"][aria-selected="true"], button[data-baseweb="tab"][aria-selected="true"]
+    {background: rgba(255,75,75,0.10); border-radius: 10px 10px 0 0;}
+.react-aria-SelectionIndicator, [data-baseweb="tab-highlight"] {height: 4px !important;}
+</style>"""
+
+
 # ---------------------------------------------------------------- app
 def main():
     st.set_page_config(page_title="CM30 Plate Viewer", page_icon="🧫", layout="wide")
+    st.markdown(TAB_CSS, unsafe_allow_html=True)
     st.title("CM30 Plate Viewer")
     st.markdown(
         "**Step 1:** Export and download your analysis .csv from the CM30  \n"
@@ -647,17 +620,21 @@ def main():
 
     with tab_heat:
         left, right = st.columns([1, 3.4], gap="large")
+        conf = confluency_export(raw)
         with left:
-            st.markdown("**Display**")
+            st.markdown("**Scale**")
             a, b = st.columns(2)
             vmin = a.number_input("Min %", value=0.0, step=5.0, key="h_min")
             vmax = b.number_input("Max %", value=100.0, step=5.0, key="h_max")
+            st.markdown("**Colors**")
             a, b = st.columns(2)
-            col0 = a.color_picker("Color at min", "#FFFFFF", key="h_c0")
-            col1 = b.color_picker("Color at max", "#8B0000", key="h_c1")
+            col0 = a.color_picker("Low color (at Min %)", "#FFFFFF", key="h_c0")
+            col1 = b.color_picker("High color (at Max %)", "#8B0000", key="h_c1")
+            st.caption("Click a swatch to pick a color.")
+            st.markdown("**Wells**")
             show_vals = st.toggle("Show values on wells", value=values_default, key=f"h_vals_{plate_size}")
             st.markdown("**Export**")
-            st.download_button("Confluency data (CSV)", confluency_csv(raw), f"{base}_confluency.csv",
+            st.download_button("Confluency data (CSV)", conf["csv"], f"{base}_confluency.csv",
                                "text/csv", key="dl_conf")
             st.caption("One row per well and timepoint, ready for pivot tables and Prism.")
         with right:
@@ -666,21 +643,26 @@ def main():
             else:
                 mean_conf = df.groupby("T_index")["Confluency"].mean().to_numpy()
                 run_player("heat", n_t, df, meta,
-                           lambda sl: heatmap_figure(sl, meta, vmin, vmax, col0, col1, show_vals),
-                           (hours, mean_conf), _chart_color(col1))
+                           lambda sl, resp: heatmap_svg(sl, meta, vmin, vmax, col0, col1, show_vals, resp),
+                           (hours, mean_conf), _chart_color(col1), base)
+        with st.expander("Preview export data"):
+            st.dataframe(conf["preview"], hide_index=True)
 
     with tab_scratch:
         left, right = st.columns([1, 3.4], gap="large")
         with left:
-            st.markdown("**Display**")
+            st.markdown("**Closure**")
             full = st.number_input("Fully closed at (% confluency)", min_value=1.0, max_value=100.0,
                                    value=95.0, step=1.0, key="s_full",
                                    help="Closure is 100% when a well reaches this confluency. "
                                         "Closure = (current - start) / (this value - start).")
             cap = st.checkbox("Cap closure at 0 to 100%", value=True, key="s_cap")
+            st.markdown("**Colors**")
             a, b = st.columns(2)
-            c_start = a.color_picker("Starting cells", "#94A3B8", key="s_c0")
-            c_mig = b.color_picker("Migration", "#0F9D8A", key="s_c1")
+            c_start = a.color_picker("Starting cells color", "#94A3B8", key="s_c0")
+            c_mig = b.color_picker("Migration color", "#0F9D8A", key="s_c1")
+            st.caption("Click a swatch to pick a color.")
+            st.markdown("**Wells**")
             show_vals = st.toggle("Show values on wells", value=values_default, key=f"s_vals_{plate_size}")
             bundle = closure_bundle(raw, float(full), bool(cap))
             if bundle["n_bad"]:
@@ -695,13 +677,15 @@ def main():
                                "text/csv", key="dl_wide")
             st.caption("Long has one row per well and timepoint, best for pivot tables and Prism. "
                        "Wide has one column per well.")
-            with st.expander("Preview export"):
-                st.dataframe(bundle["preview"], hide_index=True)
         with right:
             mean_closure = bundle["cdf"].groupby("T_index")["Closure_pct"].mean().to_numpy()
             run_player("scratch", n_t, bundle["cdf"], meta,
-                       lambda sl: scratch_figure(sl, meta, c_start, c_mig, show_vals),
-                       (hours, mean_closure), _chart_color(c_mig))
+                       lambda sl, resp: scratch_svg(sl, meta, c_start, c_mig, show_vals, resp),
+                       (hours, mean_closure), _chart_color(c_mig), base)
+        with st.expander("Preview export data"):
+            t_long, t_wide = st.tabs(["Long", "Wide"])
+            t_long.dataframe(bundle["preview"], hide_index=True)
+            t_wide.dataframe(bundle["wide_preview"], hide_index=True)
 
 
 if __name__ == "__main__":
