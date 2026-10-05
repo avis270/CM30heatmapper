@@ -1,4 +1,5 @@
 """CM30 Plate Viewer: confluency heatmap and scratch assay closure for CM30 exports."""
+import io
 import re
 from pathlib import Path
 
@@ -307,7 +308,7 @@ def heatmap_svg(sl, meta, vmin, vmax, c0, c1, show_values, responsive=True):
     s = sl.dropna(subset=["Confluency"])
     vals = {w: v for w, v in zip(s["Well"], s["Confluency"])}
     fmt = ".1f" if cols <= 6 else ".0f"
-    fs = 21 if cols <= 6 else 18 if cols <= 12 else 15
+    fs = 17 if cols <= 6 else 15 if cols <= 12 else 13
 
     body = [_tray_and_labels(meta, left, top, pw, ph)]
     tips, k = [], 0
@@ -351,7 +352,7 @@ def scratch_svg(sl, meta, c_start, c_mig, show_values, responsive=True):
     left, top, pw, ph, W, H = _plate_dims(meta, 180)
     by_well = sl.set_index("Well")
     fmt = ".1f" if cols <= 6 else ".0f"
-    fs = 20 if cols <= 6 else 17 if cols <= 12 else 14
+    fs = 15 if cols <= 6 else 13 if cols <= 12 else 12
     half0 = GAP_HALF * WELL_R
     eps = 0.04 * WELL_R
 
@@ -395,7 +396,7 @@ def scratch_svg(sl, meta, c_start, c_mig, show_values, responsive=True):
             pill = ""
             if show_values:
                 txt = f"{cl:{fmt}}%"
-                pwid, phei = len(txt) * fs * 0.58 + 18, fs * 1.7
+                pwid, phei = len(txt) * fs * 0.58 + 16, fs * 1.6
                 pill = (f'<rect x="{cx - pwid / 2:.1f}" y="{cy - phei / 2:.1f}" width="{pwid:.1f}" height="{phei:.1f}" '
                         f'rx="{phei / 2:.1f}" fill="rgba(255,255,255,.92)"/>'
                         f'<text x="{cx:.1f}" y="{cy:.1f}" text-anchor="middle" dy=".35em" font-size="{fs}" '
@@ -590,6 +591,605 @@ TAB_CSS = """<style>
 </style>"""
 
 
+# ---------------------------------------------------------------- analysis tab: conditions and group charts
+MAX_F = 5
+PALETTE = ["#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7", "#56B4E9", "#8E44AD", "#7A7A7A",
+           "#2C3E50", "#B8860B"]
+CLOSE_AT = 95.0   # mean closure (%) that counts as "closed" when choosing the default hour
+DASHES = ["solid", "dash", "dot", "dashdot", "longdash", "longdashdot"]
+AN_CONFIG = {"displaylogo": False, "displayModeBar": "hover",
+             "modeBarButtonsToRemove": ["zoom2d", "pan2d", "select2d", "lasso2d", "zoomIn2d", "zoomOut2d",
+                                        "autoScale2d", "resetScale2d"],
+             "toImageButtonOptions": {"format": "png", "scale": 3, "filename": "chart"}}
+
+
+def _well_pos(label, meta):
+    m = re.fullmatch(r"([A-Z]+)(\d+)", label)
+    if m:
+        return _letters_to_index(m.group(1)), int(m.group(2)) - 1
+    return divmod(int(label) - 1, meta["cols"])
+
+
+def _seg(label, options, key, default=None, **kw):
+    default = default if default is not None else options[0]
+    if hasattr(st, "segmented_control"):
+        v = st.segmented_control(label, options, default=default, key=key, **kw)
+        return v or default
+    return st.radio(label, options, key=key, horizontal=True, **kw)
+
+
+def _level_input(options, key):
+    try:
+        return st.selectbox("Level", options, index=None, accept_new_options=True,
+                            placeholder="Pick or type a level", key=key)
+    except TypeError:
+        return st.text_input("Level", key=key, placeholder="Type a level")
+
+
+def _init_state(meta, wells):
+    ss = st.session_state
+    sig = (tuple(wells), meta["rows"], meta["cols"])
+    if ss.get("an_sig") != sig:
+        ss["an_sig"] = sig
+        ss["an_layout"] = pd.DataFrame({"Excluded": False, **{f"f{i}": "" for i in range(MAX_F)}}, index=wells)
+        ss["an_nf"] = 2
+        ss["an_names"] = ["Cell type", "Treatment"] + [f"Condition {i + 1}" for i in range(2, MAX_F)]
+        ss["an_order"], ss["an_colors"], ss["an_ctrl"] = {}, {}, {}
+        ss["an_ver"], ss["an_gen"] = 0, 0
+        ss["an_snap"] = ss["an_layout"].copy()
+
+
+def _bump():
+    ss = st.session_state
+    ss["an_ver"] += 1
+    ss["an_gen"] = 0
+    ss["an_snap"] = ss["an_layout"].copy()
+
+
+def _ordered_levels(fi):
+    ss = st.session_state
+    col = ss["an_layout"][f"f{fi}"]
+    present = [v for v in pd.unique(col) if v != ""]
+    order = [lv for lv in ss["an_order"].get(fi, []) if lv in present]
+    order += [lv for lv in present if lv not in order]
+    ss["an_order"][fi] = order
+    return order
+
+
+def _color(fi, level):
+    ss = st.session_state
+    if (fi, level) not in ss["an_colors"]:
+        used = sum(1 for k in ss["an_colors"] if k[0] == fi)
+        ss["an_colors"][(fi, level)] = PALETTE[used % len(PALETTE)]
+    return ss["an_colors"][(fi, level)]
+
+
+def _clean_names(names):
+    out, seen = [], set()
+    for i, n in enumerate(names):
+        n = (n or "").strip() or f"Condition {i + 1}"
+        base, k = n, 2
+        while n.lower() in seen or n.lower() in ("well", "excluded"):
+            n, k = f"{base} ({k})", k + 1
+        seen.add(n.lower())
+        out.append(n)
+    return out
+
+
+def layout_to_csv(layout, names, nf, wells):
+    out = pd.DataFrame({"Well": wells})
+    for i in range(nf):
+        out[names[i]] = layout.loc[wells, f"f{i}"].to_numpy()
+    out["Excluded"] = np.where(layout.loc[wells, "Excluded"].to_numpy(), "yes", "")
+    return out.to_csv(index=False).encode()
+
+
+def parse_layout(raw_bytes, wells):
+    """Read a layout CSV in our format. Returns (layout, names, messages, ok)."""
+    msgs = []
+    try:
+        tab = pd.read_csv(io.BytesIO(raw_bytes), dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    except Exception as exc:  # noqa: BLE001
+        return None, None, [f"Could not read the file: {exc}"], False
+    cols = {c.strip().lower(): c for c in tab.columns}
+    if "well" not in cols:
+        return None, None, ["The file needs a 'Well' column."], False
+    wcol = cols["well"]
+    ecol = cols.get("excluded")
+    fcols = [c for c in tab.columns if c not in (wcol, ecol) and c.strip()]
+    if len(fcols) > MAX_F:
+        return None, None, [f"The file has {len(fcols)} condition columns. The maximum is {MAX_F}."], False
+
+    def norm(w):
+        w = w.strip().upper()
+        return w[4:] if w.startswith("WELL") else w
+
+    ids = tab[wcol].map(norm)
+    if ids.duplicated().any():
+        dup = ", ".join(ids[ids.duplicated()].unique()[:6])
+        return None, None, [f"Duplicate wells in the file: {dup}."], False
+    unknown = [w for w in ids if w not in set(wells)]
+    if unknown:
+        msgs.append(f"{len(unknown)} well(s) in the file are not on this plate and were skipped: "
+                    f"{', '.join(unknown[:8])}{'...' if len(unknown) > 8 else ''}.")
+    layout = pd.DataFrame({"Excluded": False, **{f"f{i}": "" for i in range(MAX_F)}}, index=wells)
+    tab = tab.assign(_id=ids)
+    tab = tab[tab["_id"].isin(set(wells))]
+    for i, c in enumerate(fcols):
+        layout.loc[tab["_id"].to_numpy(), f"f{i}"] = tab[c].str.strip().to_numpy()
+    if ecol is not None:
+        flag = tab[ecol].str.strip().str.lower().isin(["yes", "true", "1", "x", "y"])
+        layout.loc[tab["_id"].to_numpy(), "Excluded"] = flag.to_numpy()
+    missing = len(wells) - len(tab)
+    if missing:
+        msgs.append(f"{missing} well(s) on this plate were not in the file and stay unassigned.")
+    names = _clean_names([c.strip() for c in fcols] or ["Condition 1"])
+    return layout, names, msgs, True
+
+
+def layout_plate_figure(meta, wells, layout, color_fi, names):
+    rows, cols = meta["rows"], meta["cols"]
+    cell = min(64.0, 520.0 / cols)
+    size = cell * 0.84
+    xs, ys, fills, syms, texts, tcols, hov = [], [], [], [], [], [], []
+    for w in wells:
+        i, j = _well_pos(w, meta)
+        r = layout.loc[w]
+        lvl, excl = r[f"f{color_fi}"], bool(r["Excluded"])
+        fill = "#D1D5DB" if excl else (_color(color_fi, lvl) if lvl else "#F3F4F6")
+        xs.append(j + 0.5); ys.append(i + 0.5); fills.append(fill)
+        syms.append("circle-x" if excl else "circle")
+        texts.append(w if size >= 26 else "")
+        tcols.append(_text_on(_rgb(fill)))
+        hov.append(f"<b>Well {w}</b>" + "".join(f"<br>{names[k]}: {r[f'f{k}'] or '-'}" for k in range(len(names)))
+                   + ("<br>Excluded" if excl else ""))
+    fig = go.Figure(go.Scatter(
+        x=xs, y=ys, mode="markers+text", text=texts, textfont=dict(size=10 if cols > 12 else 11, color=tcols),
+        marker=dict(size=size, color=fills, symbol=syms, line=dict(color="#6B7280", width=1)),
+        selected=dict(marker=dict(opacity=1)), unselected=dict(marker=dict(opacity=0.35)),
+        hovertext=hov, hoverinfo="text", showlegend=False))
+    fig.update_layout(
+        height=int(rows * cell + 80), margin=dict(l=26, r=8, t=26, b=6), dragmode="select",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family=FONT, color=MUTED, size=12),
+        hoverlabel=dict(bgcolor="white", bordercolor=TRAY_EDGE, font=dict(family=FONT, color=INK, size=12)),
+        xaxis=dict(range=[0, cols], side="top", showgrid=False, zeroline=False, showline=False, ticks="",
+                   fixedrange=True, constrain="domain",
+                   tickvals=[] if meta["numbered"] else [j + 0.5 for j in range(cols)],
+                   ticktext=[] if meta["numbered"] else [str(j + 1) for j in range(cols)]),
+        yaxis=dict(range=[rows, 0], scaleanchor="x", scaleratio=1, showgrid=False, zeroline=False, showline=False,
+                   ticks="", fixedrange=True, constrain="domain",
+                   tickvals=[] if meta["numbered"] else [i + 0.5 for i in range(rows)],
+                   ticktext=[] if meta["numbered"] else [chr(65 + i) for i in range(rows)]))
+    return fig
+
+
+def _selected_wells(state, wells):
+    try:
+        idx = state["selection"]["point_indices"]
+    except Exception:  # noqa: BLE001
+        return []
+    return [wells[i] for i in idx if 0 <= i < len(wells)]
+
+
+# ---- group statistics
+def group_data(cl, xi, ci, col, normalize, ctrl):
+    d = cl[(~cl["Excluded"]) & (cl[f"f{xi}"] != "")]
+    if ci is not None:
+        d = d[d[f"f{ci}"] != ""]
+    d = d.assign(X=d[f"f{xi}"], C=(d[f"f{ci}"] if ci is not None else ""), V=d[col]).dropna(subset=["V"])
+    if normalize and ctrl:
+        cm = d[d["X"] == ctrl].groupby(["T_index", "C"])["V"].mean().rename("CM").reset_index()
+        d = d.merge(cm, on=["T_index", "C"], how="left")
+        d["V"] = np.where(d["CM"] > 1e-6, d["V"] / d["CM"] * 100, np.nan)
+        d = d.dropna(subset=["V"])
+    return d
+
+
+def _agg(d, keys):
+    g = d.groupby(keys)["V"].agg(n="count", mean="mean", sd="std").reset_index()
+    g["sem"] = g["sd"] / np.sqrt(g["n"])
+    return g
+
+
+def default_hour(d_raw, n_t):
+    """First timepoint at which any group's mean closure reaches CLOSE_AT, else the last timepoint."""
+    if d_raw.empty:
+        return n_t
+    ts = _agg(d_raw, ["X", "C", "T_index"])
+    hit = ts[ts["mean"] >= CLOSE_AT]
+    return int(hit["T_index"].min()) if len(hit) else n_t
+
+
+def _group_label(x, c):
+    return f"{x} / {c}" if c else x
+
+
+def bar_figure(s, g, x_levels, c_levels, x_color, c_color, err, ytitle, cname, has_c):
+    fig = go.Figure()
+    ncl = max(len(c_levels), 1)
+    w = 0.8 / ncl
+    rng = np.random.default_rng(0)
+    for k, cl_ in enumerate(c_levels if has_c else [""]):
+        off = (k - (ncl - 1) / 2) * w
+        sub_g = g[g["C"] == cl_].set_index("X")
+        bx, by, be, bcol, hov = [], [], [], [], []
+        for i, xl in enumerate(x_levels):
+            if xl not in sub_g.index:
+                continue
+            row = sub_g.loc[xl]
+            bx.append(i + off); by.append(row["mean"])
+            e = row[err]
+            be.append(0 if pd.isna(e) else e)
+            bcol.append(c_color.get(cl_, MUTED) if has_c else x_color.get(xl, MUTED))
+            hov.append(f"<b>{_group_label(xl, cl_)}</b><br>mean {row['mean']:.1f}<br>n = {int(row['n'])}")
+        fig.add_trace(go.Bar(
+            x=bx, y=by, width=w * 0.92, marker=dict(color=bcol), name=cl_ if has_c else "", showlegend=has_c,
+            error_y=dict(type="data", array=be, visible=True, color=INK, thickness=1.5, width=4),
+            hovertext=hov, hoverinfo="text"))
+        pts = s[s["C"] == cl_]
+        px, py, ph = [], [], []
+        for i, xl in enumerate(x_levels):
+            v = pts[pts["X"] == xl]
+            for wl_, val in zip(v["Well"], v["V"]):
+                px.append(i + off + rng.uniform(-w * 0.22, w * 0.22)); py.append(val)
+                ph.append(f"Well {wl_}: {val:.1f}")
+        fig.add_trace(go.Scatter(x=px, y=py, mode="markers", showlegend=False, hovertext=ph, hoverinfo="text",
+                                 marker=dict(size=7, color="rgba(17,24,39,.55)", line=dict(color="white", width=1))))
+    fig.update_layout(
+        height=380, margin=dict(l=60, r=10, t=20, b=50), barmode="overlay", bargap=0,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family=FONT, color=MUTED, size=13),
+        legend=dict(title=dict(text=cname), orientation="h", y=1.08, x=0),
+        xaxis=dict(tickvals=list(range(len(x_levels))), ticktext=x_levels,
+                   range=[-0.5 - max(0, (3 - len(x_levels)) * 0.6), len(x_levels) - 0.5 + max(0, (3 - len(x_levels)) * 0.6)],
+                   showgrid=False, zeroline=False, fixedrange=True),
+        yaxis=dict(title=ytitle, gridcolor="#EEF0F3", zeroline=False, rangemode="tozero", fixedrange=True),
+        hoverlabel=dict(bgcolor="white", bordercolor=TRAY_EDGE, font=dict(family=FONT, color=INK, size=12)))
+    return fig
+
+
+def curve_figure(ts, x_levels, c_levels, x_color, c_color, err, ytitle, now_h, has_c):
+    fig = go.Figure()
+    for xi_, xl in enumerate(x_levels):
+        for cl_ in (c_levels if has_c else [""]):
+            sub = ts[(ts["X"] == xl) & (ts["C"] == cl_)].sort_values("Elapsed_h")
+            if sub.empty:
+                continue
+            color = c_color.get(cl_, MUTED) if has_c else x_color.get(xl, MUTED)
+            dash = DASHES[xi_ % len(DASHES)] if has_c else "solid"
+            e = sub[err].fillna(0)
+            fig.add_trace(go.Scatter(x=sub["Elapsed_h"], y=sub["mean"] + e, mode="lines", line=dict(width=0),
+                                     hoverinfo="skip", showlegend=False))
+            fig.add_trace(go.Scatter(x=sub["Elapsed_h"], y=sub["mean"] - e, mode="lines", line=dict(width=0),
+                                     fill="tonexty", fillcolor=_rgba(color, 0.14), hoverinfo="skip",
+                                     showlegend=False))
+            fig.add_trace(go.Scatter(x=sub["Elapsed_h"], y=sub["mean"], mode="lines", name=_group_label(xl, cl_),
+                                     line=dict(color=color, width=2.2, dash=dash),
+                                     hovertemplate=f"<b>{_group_label(xl, cl_)}</b><br>%{{x:.1f}} h, %{{y:.1f}}<extra></extra>"))
+    fig.add_vline(x=now_h, line=dict(color=INK, width=1, dash="dot"))
+    fig.update_layout(
+        height=340, margin=dict(l=60, r=10, t=20, b=50), paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)", font=dict(family=FONT, color=MUTED, size=13),
+        legend=dict(orientation="h", y=1.12, x=0),
+        xaxis=dict(title="Elapsed hours", showgrid=False, zeroline=False, fixedrange=True),
+        yaxis=dict(title=ytitle, gridcolor="#EEF0F3", zeroline=False, rangemode="tozero", fixedrange=True),
+        hoverlabel=dict(bgcolor="white", bordercolor=TRAY_EDGE, font=dict(family=FONT, color=INK, size=12)))
+    return fig
+
+
+def _setup_panel(wells, meta, base):
+    """Left side: conditions, plate/table editing, levels, save and load."""
+    ss = st.session_state
+    c_names, c_edit, c_levels, c_io = st.container(), st.container(), st.container(), st.container()
+
+    # --- save and load (processed first so loaded names are in place before the name boxes draw)
+    with c_io:
+        st.markdown("**Save and load**")
+        nf0 = ss["an_nf"]
+        st.download_button("Download layout (CSV)", layout_to_csv(ss["an_layout"], _clean_names(ss["an_names"]),
+                                                               nf0, wells),
+                           f"{base}_layout.csv", "text/csv", key="an_dl_layout")
+        st.caption("Also works as a template: download, fill in the columns, and load it back.")
+        up = st.file_uploader("Load layout (CSV)", type=["csv"], key="an_up")
+        if up is not None:
+            data = up.getvalue()
+            sig = (up.name, len(data), hash(data))
+            if ss.get("an_loaded") != sig:
+                ss["an_loaded"] = sig
+                layout, names, msgs, ok = parse_layout(data, wells)
+                if ok:
+                    ss["an_layout"] = layout
+                    ss["an_nf"] = max(1, len(names))
+                    ss["an_names"] = names + [f"Condition {i + 1}" for i in range(len(names), MAX_F)]
+                    for i in range(MAX_F):
+                        ss[f"an_name_w{i}"] = ss["an_names"][i]
+                    ss["an_order"], ss["an_ctrl"] = {}, {}
+                    _bump()
+                    ss["an_load_msg"] = ("ok", msgs)
+                else:
+                    ss["an_load_msg"] = ("error", msgs)
+            kind, msgs = ss.get("an_load_msg", ("ok", []))
+            if kind == "error":
+                st.error(" ".join(msgs))
+            else:
+                st.success("Layout loaded.")
+                for m in msgs:
+                    st.warning(m)
+
+    # --- condition names
+    with c_names:
+        st.markdown("**Conditions**")
+        nf = ss["an_nf"]
+        for i in range(nf):
+            v = st.text_input(f"Condition {i + 1} name", value=ss["an_names"][i], key=f"an_name_w{i}",
+                              label_visibility="collapsed", placeholder=f"Condition {i + 1}")
+            ss["an_names"][i] = v
+        a, b, _ = st.columns([1.1, 1.1, 1.4])
+        if a.button("Add condition", disabled=nf >= MAX_F, key="an_add"):
+            ss["an_nf"] += 1
+            st.rerun(scope="fragment")
+        if b.button("Remove last", disabled=nf <= 1, key="an_rem"):
+            ss["an_layout"][f"f{nf - 1}"] = ""
+            ss["an_nf"] -= 1
+            _bump()
+            st.rerun(scope="fragment")
+    names = _clean_names(ss["an_names"])
+    nf = ss["an_nf"]
+
+    # --- edit wells
+    with c_edit:
+        st.markdown("**Assign wells**")
+        view = _seg("Edit view", ["Plate", "Table"], "an_view", label_visibility="collapsed")
+        layout = ss["an_layout"]
+        if view == "Plate":
+            color_fi = st.selectbox("Color wells by", list(range(nf)), format_func=lambda i: names[i],
+                                    key="an_colorby")
+            sel_key = f"an_plate_{ss['an_ver']}_{ss['an_gen']}"
+            sel = _selected_wells(ss.get(sel_key), wells)
+            st.caption(f"{len(sel)} well(s) selected. Drag a box or lasso on the plate, or click wells.")
+            a, b = st.columns([1, 1.4])
+            tgt = a.selectbox("Set condition", list(range(nf)), format_func=lambda i: names[i],
+                              index=min(color_fi, nf - 1), key="an_target")
+            with b:
+                level = _level_input(_ordered_levels(tgt), f"an_level_{tgt}")
+            r1 = st.columns(4)
+            apply_ = r1[0].button("Apply", type="primary", key="an_apply", disabled=not sel or not level)
+            excl = r1[1].button("Exclude", key="an_excl", disabled=not sel)
+            incl = r1[2].button("Include", key="an_incl", disabled=not sel)
+            clr = r1[3].button("Clear level", key="an_clr", disabled=not sel)
+            r2 = st.columns(4)
+            desel = r2[0].button("Deselect", key="an_desel", disabled=not sel)
+            if apply_:
+                layout.loc[sel, f"f{tgt}"] = str(level).strip()
+            if excl:
+                layout.loc[sel, "Excluded"] = True
+            if incl:
+                layout.loc[sel, "Excluded"] = False
+            if clr:
+                layout.loc[sel, f"f{tgt}"] = ""
+            if apply_ or excl or incl or clr:
+                _bump()
+                st.rerun(scope="fragment")
+            if desel:
+                ss["an_gen"] += 1
+                st.rerun(scope="fragment")
+            st.plotly_chart(layout_plate_figure(meta, wells, layout, color_fi, names), key=sel_key,
+                            on_select="rerun", selection_mode=("points", "box", "lasso"),
+                            config={"displayModeBar": False})
+            lv = _ordered_levels(color_fi)
+            chips = "".join(
+                f"<span style='display:inline-flex;align-items:center;gap:.35rem;margin:0 .9rem .3rem 0'>"
+                f"<span style='width:12px;height:12px;border-radius:50%;background:{_color(color_fi, x)};"
+                f"display:inline-block'></span>{x}</span>" for x in lv)
+            chips += (f"<span style='display:inline-flex;align-items:center;gap:.35rem;margin:0 .9rem .3rem 0'>"
+                      f"<span style='width:12px;height:12px;border-radius:50%;background:#F3F4F6;"
+                      f"border:1px solid #9CA3AF;display:inline-block'></span>Unassigned</span>")
+            st.markdown(f"<div style='font-size:.85rem'>{chips}</div>", unsafe_allow_html=True)
+        else:
+            snap = ss["an_snap"]
+            tbl = pd.DataFrame({"Well": snap.index})
+            for i in range(nf):
+                tbl[names[i]] = snap[f"f{i}"].to_numpy()
+            tbl["Excluded"] = snap["Excluded"].to_numpy()
+            st.caption("Edit cells or paste a block from Excel.")
+            cfg = {n: st.column_config.TextColumn(n) for n in names[:nf]}
+            cfg["Excluded"] = st.column_config.CheckboxColumn("Excluded")
+            edited = st.data_editor(tbl, hide_index=True, disabled=["Well"], column_config=cfg, height=420,
+                                    key=f"an_tbl_{ss['an_ver']}_{hash(tuple(names[:nf]))}")
+            for i in range(nf):
+                layout[f"f{i}"] = edited[names[i]].fillna("").astype(str).str.strip().to_numpy()
+            layout["Excluded"] = edited["Excluded"].fillna(False).astype(bool).to_numpy()
+
+    # --- levels: order, colors, control
+    with c_levels:
+        with st.expander("Levels: order, colors and control"):
+            for fi in range(nf):
+                st.markdown(f"**{names[fi]}**")
+                levels = _ordered_levels(fi)
+                if not levels:
+                    st.caption("No levels yet.")
+                    continue
+                for k, lv in enumerate(levels):
+                    c1, c2, c3, c4 = st.columns([1, 4, 1, 1], vertical_alignment="center")
+                    ss["an_colors"][(fi, lv)] = c1.color_picker(
+                        lv, value=_color(fi, lv), key=f"an_cp_{fi}_{lv}", label_visibility="collapsed")
+                    c2.write(lv)
+                    if c3.button("▲", key=f"an_up_{fi}_{lv}", disabled=k == 0):
+                        levels[k - 1], levels[k] = levels[k], levels[k - 1]
+                        ss["an_order"][fi] = levels
+                        st.rerun(scope="fragment")
+                    if c4.button("▼", key=f"an_dn_{fi}_{lv}", disabled=k == len(levels) - 1):
+                        levels[k + 1], levels[k] = levels[k], levels[k + 1]
+                        ss["an_order"][fi] = levels
+                        st.rerun(scope="fragment")
+                cur = ss["an_ctrl"].get(fi)
+                opts = ["None"] + levels
+                ctl = st.selectbox("Control level", opts, index=opts.index(cur) if cur in opts else 0,
+                                   key=f"an_ctl_{fi}_{hash(tuple(levels))}")
+                ss["an_ctrl"][fi] = None if ctl == "None" else ctl
+    return names, nf
+
+
+def _analysis_panel_body(raw, df, meta, base, names, nf, n_t, hours):
+    """Right side: choose the analysis, then charts, table and downloads."""
+    ss = st.session_state
+    layout = ss["an_layout"]
+    used = [i for i in range(nf) if (layout[f"f{i}"] != "").any()]
+    if not used:
+        st.info("Name your conditions and assign wells on the left. Charts appear here as soon as at least "
+                "one condition has levels.")
+        st.markdown("**How it works**  \n1. Name up to 5 conditions, for example cell type or media.  \n"
+                    "2. Drag over wells on the plate, pick or type a level, and press Apply. "
+                    "You can also paste into the table view or load a saved layout.  \n"
+                    "3. Pick what to compare and read the charts.")
+        return
+
+    r1 = st.columns([1.5, 1.2, 1.2, 1, 1.3])
+    measure = r1[0].selectbox("Measure", ["Scratch closure", "Confluency"], key="an_measure")
+    multi = [i for i in used if layout.loc[layout[f"f{i}"] != "", f"f{i}"].nunique() >= 2]
+    x_default = (multi or used)[0]
+    xi = r1[1].selectbox("Compare (x-axis)", used, index=used.index(x_default), format_func=lambda i: names[i],
+                         key=f"an_x_{hash((tuple(used), tuple(multi)))}")
+    copts = ["None"] + [i for i in used if i != xi]
+    cv = r1[2].selectbox("Color by", copts, format_func=lambda i: "None" if i == "None" else names[i],
+                         key=f"an_c_{hash(tuple(copts))}")
+    ci = None if cv == "None" else cv
+    err_name = r1[3].selectbox("Error bars", ["SD", "SEM"], key="an_err")
+    err = "sd" if err_name == "SD" else "sem"
+    ctrl = ss["an_ctrl"].get(xi)
+    normalize = r1[4].checkbox("Normalize to control", value=False, key="an_norm", disabled=not ctrl,
+                               help="Divides each value by the control level's mean (same color group, same time) "
+                                    "and shows % of control. Set the control level under Levels.")
+    if not ctrl:
+        r1[4].caption(f"Set a control level for {names[xi]} under Levels.")
+    normalize = bool(normalize and ctrl)
+
+    closure = measure == "Scratch closure"
+    if closure:
+        r2 = st.columns([1.3, 1.3, 3])
+        full = r2[0].number_input("Fully closed at (% confluency)", min_value=1.0, max_value=100.0, value=95.0,
+                                  step=1.0, key="an_full")
+        cap = r2[1].checkbox("Cap closure at 0 to 100%", value=True, key="an_cap")
+    else:
+        full, cap = 95.0, True
+    bundle = closure_bundle(raw, float(full), bool(cap))
+    cdf = bundle["cdf"]
+    lay = layout.reset_index().rename(columns={"index": "Well"})
+    cl = cdf.merge(lay, on="Well", how="left")
+    cl["Excluded"] = cl["Excluded"].fillna(False).astype(bool)
+    for i in range(MAX_F):
+        cl[f"f{i}"] = cl[f"f{i}"].fillna("")
+
+    col = "Closure_pct" if closure else "Confluency"
+    ytitle = ("% of control" if normalize else ("% closure" if closure else "% confluency"))
+    d_all = group_data(cl, xi, ci, col, normalize, ctrl)
+    if d_all.empty:
+        st.warning("No wells have a level for the chosen conditions yet.")
+        return
+
+    # default hour: first time any group reaches full closure
+    if closure:
+        d_raw = group_data(cl, xi, ci, "Closure_pct", False, None)
+        t_def = default_hour(d_raw, n_t)
+    else:
+        t_def = n_t
+    sig = (measure, float(full), bool(cap), xi, ci, int(pd.util.hash_pandas_object(layout, index=True).sum() % 10**9))
+    t = st.select_slider("Hour for the bar chart and table", options=list(range(1, n_t + 1)), value=t_def,
+                         format_func=lambda k: f"{hours[k - 1]:.1f} h", key=f"an_hour_{hash(sig)}")
+    if closure:
+        st.caption(f"Default is the first hour any group's mean closure reaches {CLOSE_AT:g}% "
+                   f"({hours[t_def - 1]:.1f} h), or the last timepoint if none does. Move the slider to change it.")
+
+    x_levels = [x for x in _ordered_levels(xi) if x in set(d_all["X"])]
+    c_levels = [c for c in (_ordered_levels(ci) if ci is not None else [""]) if c in set(d_all["C"])]
+    x_color = {x: _color(xi, x) for x in x_levels}
+    c_color = {c: _color(ci, c) for c in c_levels} if ci is not None else {}
+    cname = names[ci] if ci is not None else ""
+
+    s = d_all[d_all["T_index"] == t]
+    g = _agg(s, ["X", "C"])
+    if g.empty:
+        st.warning("No data at this hour for the chosen groups.")
+        return
+
+    st.markdown(f"**{measure} by {names[xi]}" + (f" and {names[ci]}" if ci is not None else "")
+                + f" at {hours[t - 1]:.1f} h**")
+    st.plotly_chart(bar_figure(s, g, x_levels, c_levels, x_color, c_color, err, ytitle, cname, ci is not None),
+                    config=AN_CONFIG, key="an_bar")
+    if (g["n"] == 1).any():
+        st.caption("Some groups have a single well, so they have no error bars.")
+
+    ts = _agg(d_all, ["X", "C", "T_index", "Elapsed_h"])
+    st.markdown("**Over time**")
+    st.plotly_chart(curve_figure(ts, x_levels, c_levels, x_color, c_color, err, ytitle, hours[t - 1], ci is not None),
+                    config=AN_CONFIG, key="an_curve")
+
+    # summary table and downloads
+    g["Group"] = [_group_label(x, c) for x, c in zip(g["X"], g["C"])]
+    g["xo"] = g["X"].map({x: k for k, x in enumerate(x_levels)})
+    g["co"] = g["C"].map({c: k for k, c in enumerate(c_levels)})
+    g = g.sort_values(["xo", "co"])
+    cols = {"Group": "Group", "n": "n", "mean": "Mean", "sd": "SD", "sem": "SEM"}
+    summ = g[list(cols)].rename(columns=cols)
+    if ci is not None:
+        summ.insert(1, names[ci], g["C"].to_numpy())
+        summ.insert(1, names[xi], g["X"].to_numpy())
+        summ = summ.drop(columns="Group")
+    else:
+        summ.insert(1, names[xi], g["X"].to_numpy())
+        summ = summ.drop(columns="Group")
+    summ = summ.round({"Mean": 2, "SD": 2, "SEM": 2})
+    summ.insert(0, "Hour", round(float(hours[t - 1]), 2))
+    summ.insert(1, "Measure", ytitle)
+    st.markdown("**Summary**")
+    st.dataframe(summ, hide_index=True)
+
+    s2 = s.assign(Group=[_group_label(x, c) for x, c in zip(s["X"], s["C"])])
+    order = list(g["Group"])
+    prism = s2.assign(Rep=s2.groupby("Group").cumcount() + 1).pivot(index="Rep", columns="Group", values="V")
+    prism = prism.reindex(columns=order).reset_index()
+    prism.columns.name = None
+
+    long_out = cl.sort_values(["RowIdx", "ColIdx", "T_index"]).copy()
+    long_out["Time"] = long_out["ReferenceTime"].dt.strftime("%Y-%m-%d %H:%M")
+    long_out = long_out.rename(columns={f"f{i}": names[i] for i in range(nf)}).rename(columns={"T_index": "Timepoint"})
+    long_out["Excluded"] = np.where(long_out["Excluded"], "yes", "")
+    keep = ["Well", "Row", "Column"] + [names[i] for i in range(nf)] + ["Excluded", "Timepoint", "Time", "Elapsed_h",
+                                                                         "Confluency", "Closure_pct"]
+    st.markdown("**Export**")
+    e1, e2, e3, _ = st.columns([1, 1, 1.4, 1])
+    e1.download_button("Summary (CSV)", summ.to_csv(index=False).encode(), f"{base}_group_summary.csv",
+                       "text/csv", key="an_dl_sum")
+    e2.download_button("Prism layout (CSV)", prism.to_csv(index=False).encode(), f"{base}_group_prism.csv",
+                       "text/csv", key="an_dl_prism")
+    e3.download_button("All wells with conditions (CSV)", long_out[keep].to_csv(index=False).encode(),
+                       f"{base}_wells_with_conditions.csv", "text/csv", key="an_dl_long")
+    st.caption("Prism layout has one column per group and one row per replicate, at the hour chosen above.")
+
+
+@st.fragment
+def analysis_panel(raw, df, meta, base):
+    ss = st.session_state
+    wells = meta["well_order"]
+    _init_state(meta, wells)
+    n_t = int(df["T_index"].max())
+    hours = df.groupby("T_index")["Elapsed_h"].first().to_numpy()
+    hide = ss.get("an_hide", False)
+    if hide:
+        if st.button("Show setup", key="an_show"):
+            ss["an_hide"] = False
+            st.rerun(scope="fragment")
+        _analysis_panel_body(raw, df, meta, base, _clean_names(ss["an_names"]), ss["an_nf"], n_t, hours)
+        return
+    left, right = st.columns([1.15, 2], gap="large")
+    with left:
+        if st.button("Hide setup", key="an_hide_btn", help="Give the charts the full width"):
+            ss["an_hide"] = True
+            st.rerun(scope="fragment")
+        names, nf = _setup_panel(wells, meta, base)
+    with right:
+        _analysis_panel_body(raw, df, meta, base, names, nf, n_t, hours)
+
+
 # ---------------------------------------------------------------- app
 def main():
     st.set_page_config(page_title="CM30 Plate Viewer", page_icon="🧫", layout="wide")
@@ -616,7 +1216,7 @@ def main():
     plate_size = meta["rows"] * meta["cols"]
     values_default = plate_size <= 24
     hours = df.groupby("T_index")["Elapsed_h"].first().to_numpy()
-    tab_heat, tab_scratch = st.tabs(["Heatmap", "Scratch assay"])
+    tab_heat, tab_scratch, tab_analysis = st.tabs(["Heatmap", "Scratch assay", "Analysis"])
 
     with tab_heat:
         left, right = st.columns([1, 3.4], gap="large")
@@ -686,6 +1286,9 @@ def main():
             t_long, t_wide = st.tabs(["Long", "Wide"])
             t_long.dataframe(bundle["preview"], hide_index=True)
             t_wide.dataframe(bundle["wide_preview"], hide_index=True)
+
+    with tab_analysis:
+        analysis_panel(raw, df, meta, base)
 
 
 if __name__ == "__main__":
