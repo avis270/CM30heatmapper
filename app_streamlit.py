@@ -23,6 +23,7 @@ RING = "rgba(17,24,39,0.25)"
 WELL_R = 0.42       # well radius in plate units (one well = 1 x 1)
 GAP_HALF = 0.5      # half-width of the schematic scratch, as a fraction of the well radius
 HEAT_BINS = 48      # color steps used to draw the heatmap
+FULL_DRAW = 0.975   # closure above this is drawn as fully closed (no hairline gap)
 SPEEDS = {"0.5x": 0.5, "1x": 1.0, "2x": 2.0}
 
 WELL_LINE = re.compile(r"^Well([A-Za-z]+\d+|\d+)$", re.I)
@@ -279,7 +280,7 @@ def _empty_positions(rows, cols, cx, cy):
 
 
 def _canvas(rows, cols, numbered, x_pad):
-    cell = min(130.0, 1000.0 / (cols + x_pad))
+    cell = min(130.0, 900.0 / (cols + x_pad))
     left = 0.1 if numbered else 0.45
     fig = go.Figure()
     fig.update_layout(
@@ -330,7 +331,7 @@ def _hover_layer(fig, cx, cy, size, hovertext, text=None, text_colors=None, fs=1
 
 
 # ---------------------------------------------------------------- figures
-def heatmap_figure(sl, meta, vmin, vmax, c0, c1):
+def heatmap_figure(sl, meta, vmin, vmax, c0, c1, show_values=True):
     rows, cols = meta["rows"], meta["cols"]
     fig, cell = _canvas(rows, cols, meta["numbered"], 1.3)
     r = WELL_R
@@ -358,7 +359,8 @@ def heatmap_figure(sl, meta, vmin, vmax, c0, c1):
     _hover_layer(
         fig, cx, cy, min(cell * 0.8, 100),
         [f"<b>Well {w}</b><br>Confluency {val:.1f}%" for w, val in zip(s["Well"], v)],
-        [f"{val:{fmt}}%" for val in v], [_text_on(colors[k]) for k in bins], fs)
+        [f"{val:{fmt}}%" for val in v] if show_values else None,
+        [_text_on(colors[k]) for k in bins], fs)
 
     # scale bar, drawn in plate coordinates so it hugs the plate at any window width
     xb, y_top, y_bot = cols + 0.3, 0.4, rows - 0.4
@@ -378,7 +380,7 @@ def heatmap_figure(sl, meta, vmin, vmax, c0, c1):
     return fig
 
 
-def scratch_figure(sl, meta, c_start, c_mig):
+def scratch_figure(sl, meta, c_start, c_mig, show_values=True):
     rows, cols = meta["rows"], meta["cols"]
     fig, cell = _canvas(rows, cols, meta["numbered"], 1.9)
     r = WELL_R
@@ -403,7 +405,7 @@ def scratch_figure(sl, meta, c_start, c_mig):
 
     # layer 2: migrated cells grow from the original cell fronts toward the middle of the gap
     m = c > 0.002
-    full = c > 0.998
+    full = c > FULL_DRAW
     if m.any():
         top_b = np.where(full, half0 + eps, -gh)[m]
         Xt, Yt = _strip_xy(cx[m], cy[m], r, np.full(m.sum(), -half0 - eps), top_b)
@@ -427,7 +429,7 @@ def scratch_figure(sl, meta, c_start, c_mig):
     fs = int(max(9, min(15, cell * 0.16)))
     chars = 6 if cols <= 6 else 4
     pw, ph = (chars * fs * 0.6 + 10) / cell, fs * 1.5 / cell
-    if len(cx):
+    if show_values and len(cx):
         tx, ty = _rounded_rect_xy(-pw / 2, -ph / 2, pw / 2, ph / 2, ph / 2, 6)
         fig.add_trace(_fill_trace(cx[:, None] + tx, cy[:, None] + ty, "rgba(255,255,255,0.9)"))
 
@@ -439,7 +441,7 @@ def scratch_figure(sl, meta, c_start, c_mig):
         else:
             labels.append("")
             hover.append(f"<b>Well {w}</b><br>Closure unavailable<br>Starts at {c0v:.1f}% confluency")
-    _hover_layer(fig, cx_all, cy_all, min(cell * 0.8, 100), hover, labels, INK, fs)
+    _hover_layer(fig, cx_all, cy_all, min(cell * 0.8, 100), hover, labels if show_values else None, INK, fs)
 
     # key, drawn next to the plate
     kx, ky = cols + 0.3, rows / 2 + np.array([-0.4, 0.0, 0.4])
@@ -461,20 +463,95 @@ PLOT_CONFIG = {
 }
 
 
+# ---------------------------------------------------------------- time chart (also the scrubber)
+def _rgba(hex_color, alpha):
+    r, g, b = _rgb(hex_color)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def time_chart(hours, values, t, color):
+    """Plate-average curve with a marker at the current timepoint. Clicking anywhere selects a timepoint."""
+    hours = np.asarray(hours, float)
+    values = np.asarray(values, float)
+    n = len(hours)
+    now = hours[t - 1]
+    dx = float(np.median(np.diff(hours))) if n > 1 else 1.0
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hours, y=values, mode="lines", line=dict(color=color, width=2), fill="tozeroy",
+        fillcolor=_rgba(color, 0.16), showlegend=False,
+        hovertemplate="%{x:.1f} h, %{y:.1f}%<extra></extra>"))
+    # invisible full-height bars make the whole chart area clickable
+    fig.add_trace(go.Bar(
+        x=hours, y=np.full(n, 100.0), width=dx, customdata=np.arange(1, n + 1),
+        marker=dict(color="rgba(0,0,0,0)"), selected=dict(marker=dict(opacity=0)),
+        unselected=dict(marker=dict(opacity=0)), hoverinfo="none", showlegend=False))
+    fig.add_shape(type="line", x0=now, x1=now, y0=0, y1=100, line=dict(color=INK, width=1.2, dash="dot"))
+    fig.add_trace(go.Scatter(
+        x=[now], y=[0], mode="markers", cliponaxis=False, hoverinfo="skip", showlegend=False,
+        marker=dict(size=13, color=INK, line=dict(color="white", width=2))))
+    fig.update_layout(
+        height=150, margin=dict(l=44, r=8, t=8, b=40), bargap=0, hovermode="x", showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family=FONT, color=MUTED, size=12),
+        hoverlabel=dict(bgcolor="white", bordercolor=TRAY_EDGE, font=dict(family=FONT, color=INK, size=12)),
+        xaxis=dict(range=[hours[0], hours[-1]], title=dict(text="Elapsed hours", standoff=6), fixedrange=True,
+                   showgrid=False, zeroline=False, showline=True, linecolor=TRAY_EDGE, ticks="outside",
+                   tickcolor=TRAY_EDGE),
+        yaxis=dict(range=[0, 100], tickvals=[0, 50, 100], fixedrange=True, gridcolor="#EEF0F3", zeroline=False,
+                   showline=False, ticks=""),
+    )
+    return fig
+
+
+def _t_from_points(points, hours, n_t):
+    """Turn Streamlit's plotly selection points into a 1-based timepoint (or None)."""
+    hours = np.asarray(hours, float)
+    for p in points or []:
+        cd = p.get("customdata")
+        if isinstance(cd, (list, tuple)):
+            cd = cd[0] if cd else None
+        if cd is not None:
+            try:
+                return int(min(max(int(cd), 1), n_t))
+            except (TypeError, ValueError):
+                pass
+    for p in points or []:
+        if "x" in p:
+            try:
+                return int(np.abs(hours - float(p["x"])).argmin()) + 1
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
 # ---------------------------------------------------------------- timepoint player
-def _header_text(t, n_t, elapsed, ref):
+def _header_html(t, n_t, elapsed, ref):
     clock = ref.strftime("%I:%M %p").lstrip("0")
     date = f"{ref:%b} {ref.day}, {ref.year}"
-    return (f"**Timepoint {t} of {n_t}** &nbsp;&nbsp;&nbsp; {elapsed:.1f} h elapsed "
-            f"&nbsp;&nbsp;&nbsp; {clock}, {date}")
+    return (
+        "<div style='display:flex;align-items:baseline;gap:1rem;flex-wrap:wrap;margin:0.1rem 0 0.3rem'>"
+        f"<span style='font-size:2rem;font-weight:600;line-height:1.1'>{elapsed:.1f} h</span>"
+        f"<span style='color:{MUTED}'>elapsed</span>"
+        f"<span style='color:{MUTED}'>Timepoint {t} of {n_t}</span>"
+        f"<span style='color:{MUTED}'>{clock}, {date}</span></div>")
 
 
-def _player(prefix, n_t, df, meta, figure_fn, used_speed):
-    """Slider, play button, header, plate and footnote. Runs as a fragment so ticks only redraw this block."""
-    tkey, pkey, skey = f"{prefix}_t", f"{prefix}_play", f"{prefix}_speed"
+def _speed_control(container, key):
+    if hasattr(st, "segmented_control"):
+        container.segmented_control("Speed", list(SPEEDS), default="1x", key=key, label_visibility="collapsed")
+    else:
+        container.radio("Speed", list(SPEEDS), key=key, horizontal=True, label_visibility="collapsed")
+
+
+def _player(prefix, n_t, df, meta, figure_fn, series, chart_color, used_speed):
+    """Player row, header, plate, footnote and time chart. Runs as a fragment so ticks only redraw this block."""
+    tkey, pkey, skey, gkey = f"{prefix}_t", f"{prefix}_play", f"{prefix}_speed", f"{prefix}_gen"
     st.session_state.setdefault(tkey, 1)
     st.session_state.setdefault(pkey, False)
-    st.session_state.setdefault(skey, "1x")
+    st.session_state.setdefault(gkey, 0)
+    hours, values = series
 
     if st.session_state[pkey]:
         if st.session_state[tkey] >= n_t:
@@ -483,40 +560,62 @@ def _player(prefix, n_t, df, meta, figure_fn, used_speed):
         else:
             st.session_state[tkey] += 1
 
-    c_btn, c_speed, c_slide = st.columns([1, 1.6, 6], vertical_alignment="bottom")
-    playing = st.session_state[pkey]
-    if n_t > 1 and c_btn.button("Pause" if playing else "Play", key=f"{prefix}_btn"):
-        if playing:
-            st.session_state[pkey] = False
-        else:
-            if st.session_state[tkey] >= n_t:
-                st.session_state[tkey] = 1
-            st.session_state[pkey] = True
-        st.rerun()  # full rerun so the fragment timer is redefined
     if n_t > 1:
-        c_speed.radio("Speed", list(SPEEDS), key=skey, horizontal=True, label_visibility="collapsed")
-        if st.session_state[skey] != used_speed:
+        c_play, c_prev, c_next, c_speed, _ = st.columns([1, 0.5, 0.5, 2.4, 4], vertical_alignment="center")
+        playing = st.session_state[pkey]
+        if c_play.button("Pause" if playing else "Play", key=f"{prefix}_btn"):
+            if playing:
+                st.session_state[pkey] = False
+            else:
+                if st.session_state[tkey] >= n_t:
+                    st.session_state[tkey] = 1
+                st.session_state[pkey] = True
+            st.rerun()  # full rerun so the fragment timer is redefined
+        if c_prev.button("‹", key=f"{prefix}_prev", help="Previous timepoint"):
+            st.session_state[tkey] = max(1, st.session_state[tkey] - 1)
+        if c_next.button("›", key=f"{prefix}_next", help="Next timepoint"):
+            st.session_state[tkey] = min(n_t, st.session_state[tkey] + 1)
+        _speed_control(c_speed, skey)
+        if (st.session_state.get(skey) or "1x") != used_speed:
             st.rerun()
-        c_slide.slider("Select timepoint", 1, n_t, key=tkey, format="Timepoint %d",
-                       label_visibility="collapsed")
-    t = int(st.session_state[tkey]) if n_t > 1 else 1
 
+    t = int(min(max(st.session_state[tkey], 1), n_t))
     sl = df[df["T_index"] == t]
     ref, elapsed = sl["ReferenceTime"].iloc[0], sl["Elapsed_h"].iloc[0]
-    st.markdown(_header_text(t, n_t, elapsed, ref))
+    st.markdown(_header_html(t, n_t, elapsed, ref), unsafe_allow_html=True)
     st.plotly_chart(figure_fn(sl), config=PLOT_CONFIG, key=f"{prefix}_plot")
     st.markdown(
         f"<div style='text-align:right;font-size:0.75rem;color:{FAINT}'>"
         f"{meta['project']}: {meta['vessel']}, {ref:%Y-%m-%d %H:%M}, {elapsed:.1f} h</div>",
         unsafe_allow_html=True)
 
+    if n_t > 1:
+        st.caption("Plate average over time. Click the chart to jump to a timepoint.")
+        event = st.plotly_chart(
+            time_chart(hours, values, t, chart_color), config={"displayModeBar": False},
+            key=f"{prefix}_tc_{st.session_state[gkey]}", on_select="rerun", selection_mode="points")
+        points = (event or {}).get("selection", {}).get("points", []) if event else []
+        new_t = _t_from_points(points, hours, n_t)
+        if new_t is not None:
+            st.session_state[tkey] = new_t
+            st.session_state[gkey] += 1      # new chart key clears the selection so the next click registers
+            try:
+                st.rerun(scope="fragment")
+            except Exception:
+                st.rerun()
 
-def run_player(prefix, n_t, df, meta, figure_fn):
+
+def run_player(prefix, n_t, df, meta, figure_fn, series, chart_color):
     playing = st.session_state.get(f"{prefix}_play", False)
-    speed_label = st.session_state.get(f"{prefix}_speed", "1x")
+    speed_label = st.session_state.get(f"{prefix}_speed") or "1x"
     interval = 1.0 / SPEEDS[speed_label]
     frag = st.fragment(run_every=interval if playing else None)(_player)
-    frag(prefix, n_t, df, meta, figure_fn, speed_label)
+    frag(prefix, n_t, df, meta, figure_fn, series, chart_color, speed_label)
+
+
+def _chart_color(hex_color):
+    r, g, b = _rgb(hex_color)
+    return hex_color if (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.85 else MUTED
 
 
 # ---------------------------------------------------------------- app
@@ -541,50 +640,68 @@ def main():
 
     base = Path(up.name).stem
     n_t = int(df["T_index"].max())
+    plate_size = meta["rows"] * meta["cols"]
+    values_default = plate_size <= 24
+    hours = df.groupby("T_index")["Elapsed_h"].first().to_numpy()
     tab_heat, tab_scratch = st.tabs(["Heatmap", "Scratch assay"])
 
     with tab_heat:
-        top, bottom = st.container(), st.container()
-        with bottom:
-            c1_, c2_, c3_, c4_, _ = st.columns([1, 1, 1, 1, 3])
-            vmin = c1_.number_input("Min %", value=0.0, step=5.0, key="h_min")
-            col0 = c2_.color_picker("Color at min", "#FFFFFF", key="h_c0")
-            vmax = c3_.number_input("Max %", value=100.0, step=5.0, key="h_max")
-            col1 = c4_.color_picker("Color at max", "#8B0000", key="h_c1")
-            st.download_button("Download confluency data (CSV)", confluency_csv(raw),
-                               f"{base}_confluency.csv", "text/csv", key="dl_conf")
-        with top:
+        left, right = st.columns([1, 3.4], gap="large")
+        with left:
+            st.markdown("**Display**")
+            a, b = st.columns(2)
+            vmin = a.number_input("Min %", value=0.0, step=5.0, key="h_min")
+            vmax = b.number_input("Max %", value=100.0, step=5.0, key="h_max")
+            a, b = st.columns(2)
+            col0 = a.color_picker("Color at min", "#FFFFFF", key="h_c0")
+            col1 = b.color_picker("Color at max", "#8B0000", key="h_c1")
+            show_vals = st.toggle("Show values on wells", value=values_default, key=f"h_vals_{plate_size}")
+            st.markdown("**Export**")
+            st.download_button("Confluency data (CSV)", confluency_csv(raw), f"{base}_confluency.csv",
+                               "text/csv", key="dl_conf")
+            st.caption("One row per well and timepoint, ready for pivot tables and Prism.")
+        with right:
             if vmax <= vmin:
                 st.warning("Max must be greater than min.")
             else:
+                mean_conf = df.groupby("T_index")["Confluency"].mean().to_numpy()
                 run_player("heat", n_t, df, meta,
-                           lambda sl: heatmap_figure(sl, meta, vmin, vmax, col0, col1))
+                           lambda sl: heatmap_figure(sl, meta, vmin, vmax, col0, col1, show_vals),
+                           (hours, mean_conf), _chart_color(col1))
 
     with tab_scratch:
-        top, bottom = st.container(), st.container()
-        with bottom:
-            s1, s2, s3, s4, _ = st.columns([1.3, 1.3, 1, 1, 2])
-            full = s1.number_input("Fully closed at (% confluency)", min_value=1.0, max_value=100.0,
-                                   value=95.0, step=1.0, key="s_full")
-            cap = s2.checkbox("Cap closure at 0 to 100%", value=True, key="s_cap")
-            c_start = s3.color_picker("Starting cells", "#94A3B8", key="s_c0")
-            c_mig = s4.color_picker("Migration", "#0F9D8A", key="s_c1")
+        left, right = st.columns([1, 3.4], gap="large")
+        with left:
+            st.markdown("**Display**")
+            full = st.number_input("Fully closed at (% confluency)", min_value=1.0, max_value=100.0,
+                                   value=95.0, step=1.0, key="s_full",
+                                   help="Closure is 100% when a well reaches this confluency. "
+                                        "Closure = (current - start) / (this value - start).")
+            cap = st.checkbox("Cap closure at 0 to 100%", value=True, key="s_cap")
+            a, b = st.columns(2)
+            c_start = a.color_picker("Starting cells", "#94A3B8", key="s_c0")
+            c_mig = b.color_picker("Migration", "#0F9D8A", key="s_c1")
+            show_vals = st.toggle("Show values on wells", value=values_default, key=f"s_vals_{plate_size}")
             bundle = closure_bundle(raw, float(full), bool(cap))
             if bundle["n_bad"]:
                 st.warning(f"{bundle['n_bad']} well(s) start at or above {full:g}% confluency, so closure can't "
                            "be calculated for them. Raise the fully closed value if that is unexpected.")
             st.caption("Migration bands show how far cells have moved into the scratch. The gap width is "
                        "schematic. Time zero is the first timepoint.")
-            d1, d2, _ = st.columns([1.4, 1.4, 4])
-            d1.download_button("Download closure, long (CSV)", bundle["long_csv"],
-                               f"{base}_closure_long.csv", "text/csv", key="dl_long")
-            d2.download_button("Download closure, wide (CSV)", bundle["wide_csv"],
-                               f"{base}_closure_wide.csv", "text/csv", key="dl_wide")
+            st.markdown("**Export**")
+            st.download_button("Closure, long (CSV)", bundle["long_csv"], f"{base}_closure_long.csv",
+                               "text/csv", key="dl_long")
+            st.download_button("Closure, wide (CSV)", bundle["wide_csv"], f"{base}_closure_wide.csv",
+                               "text/csv", key="dl_wide")
+            st.caption("Long has one row per well and timepoint, best for pivot tables and Prism. "
+                       "Wide has one column per well.")
             with st.expander("Preview export"):
                 st.dataframe(bundle["preview"], hide_index=True)
-        with top:
+        with right:
+            mean_closure = bundle["cdf"].groupby("T_index")["Closure_pct"].mean().to_numpy()
             run_player("scratch", n_t, bundle["cdf"], meta,
-                       lambda sl: scratch_figure(sl, meta, c_start, c_mig))
+                       lambda sl: scratch_figure(sl, meta, c_start, c_mig, show_vals),
+                       (hours, mean_closure), _chart_color(c_mig))
 
 
 if __name__ == "__main__":
