@@ -501,13 +501,39 @@ def _speed_control(container, key):
         container.radio("Speed", list(INTERVALS), key=key, horizontal=True, label_visibility="collapsed")
 
 
+def _tc_signature(points):
+    out = []
+    for p in points or []:
+        cd = p.get("customdata")
+        if isinstance(cd, (list, tuple)):
+            cd = cd[0] if cd else None
+        out.append(cd if cd is not None else p.get("x"))
+    return tuple(out)
+
+
 def _player(prefix, n_t, df, meta, svg_fn, series, chart_color, used_speed, base):
     """Controls, time chart, header, plate and footnote. Runs as a fragment so ticks only redraw this block."""
     tkey, pkey, skey, gkey = f"{prefix}_t", f"{prefix}_play", f"{prefix}_speed", f"{prefix}_gen"
+    lkey = f"{prefix}_tc_last"
     st.session_state.setdefault(tkey, 1)
     st.session_state.setdefault(pkey, False)
     st.session_state.setdefault(gkey, 0)
     hours, values = series
+    tc_key = f"{prefix}_tc_{st.session_state[gkey]}"
+
+    # a click on the time chart is applied first, before anything is drawn, so it costs one pass
+    if n_t > 1:
+        state = st.session_state.get(tc_key)
+        try:
+            pts = state["selection"]["points"] if state else []
+        except Exception:  # noqa: BLE001
+            pts = []
+        sig = _tc_signature(pts)
+        if sig and sig != st.session_state.get(lkey):
+            new_t = _t_from_points(pts, hours, n_t)
+            if new_t is not None:
+                st.session_state[tkey] = new_t
+            st.session_state[lkey] = sig
 
     if st.session_state[pkey]:
         if st.session_state[tkey] >= n_t:
@@ -517,9 +543,11 @@ def _player(prefix, n_t, df, meta, svg_fn, series, chart_color, used_speed, base
             st.session_state[tkey] += 1
 
     if n_t > 1:
-        c_play, c_prev, c_next, c_speed, c_hint = st.columns([1, 0.5, 0.5, 2.4, 3.2], vertical_alignment="center")
+        c_play, c_prev, c_next, c_speed, c_hint = st.columns([0.5, 0.5, 0.5, 2.6, 5], vertical_alignment="center",
+                                                            gap="small")
         playing = st.session_state[pkey]
-        if c_play.button("Pause" if playing else "Play", key=f"{prefix}_btn"):
+        if c_play.button("", key=f"{prefix}_btn", icon=":material/pause:" if playing else ":material/play_arrow:",
+                         help="Pause" if playing else "Play"):
             if playing:
                 st.session_state[pkey] = False
             else:
@@ -527,10 +555,14 @@ def _player(prefix, n_t, df, meta, svg_fn, series, chart_color, used_speed, base
                     st.session_state[tkey] = 1
                 st.session_state[pkey] = True
             st.rerun()  # full rerun so the fragment timer is redefined
-        if c_prev.button("‹", key=f"{prefix}_prev", help="Previous timepoint"):
+        if c_prev.button("", key=f"{prefix}_prev", icon=":material/skip_previous:", help="Previous timepoint"):
             st.session_state[tkey] = max(1, st.session_state[tkey] - 1)
-        if c_next.button("›", key=f"{prefix}_next", help="Next timepoint"):
+            st.session_state[gkey] += 1
+            st.session_state[lkey] = None
+        if c_next.button("", key=f"{prefix}_next", icon=":material/skip_next:", help="Next timepoint"):
             st.session_state[tkey] = min(n_t, st.session_state[tkey] + 1)
+            st.session_state[gkey] += 1
+            st.session_state[lkey] = None
         _speed_control(c_speed, skey)
         if (st.session_state.get(skey) or "1x") != used_speed:
             st.rerun()
@@ -538,21 +570,12 @@ def _player(prefix, n_t, df, meta, svg_fn, series, chart_color, used_speed, base
                         "Click the chart to jump to a time</div>", unsafe_allow_html=True)
 
     t = int(min(max(st.session_state[tkey], 1), n_t))
+    tc_key = f"{prefix}_tc_{st.session_state[gkey]}"
 
     if n_t > 1:
         st.markdown(_playhead_html(hours, t), unsafe_allow_html=True)
-        event = st.plotly_chart(
-            time_chart(hours, values, chart_color), config={"displayModeBar": False},
-            key=f"{prefix}_tc_{st.session_state[gkey]}", on_select="rerun", selection_mode="points")
-        points = (event or {}).get("selection", {}).get("points", []) if event else []
-        new_t = _t_from_points(points, hours, n_t)
-        if new_t is not None:
-            st.session_state[tkey] = new_t
-            st.session_state[gkey] += 1      # new chart key clears the selection so the next click registers
-            try:
-                st.rerun(scope="fragment")
-            except Exception:
-                st.rerun()
+        st.plotly_chart(time_chart(hours, values, chart_color), config={"displayModeBar": False},
+                        key=tc_key, on_select="rerun", selection_mode="points")
 
     sl = df[df["T_index"] == t]
     ref, elapsed = sl["ReferenceTime"].iloc[0], sl["Elapsed_h"].iloc[0]
@@ -826,7 +849,7 @@ def _arc(cx, cy, r, a0, a1, n=26):
     return cx + r * np.cos(th), cy + r * np.sin(th)
 
 
-def layout_plate_figure(meta, wells, layout, names, active):
+def layout_plate_figure(meta, wells, layout, names, active, click_mode=False):
     """Each well is split into one wedge per active condition (clockwise from the top)."""
     rows, cols = meta["rows"], meta["cols"]
     cap = 110.0 if cols <= 4 else 80.0 if cols <= 6 else 64.0
@@ -877,7 +900,7 @@ def layout_plate_figure(meta, wells, layout, names, active):
         selected=dict(marker=dict(color="rgba(17,24,39,0.22)", opacity=1)),
         unselected=dict(marker=dict(opacity=1)), hovertext=hov, hoverinfo="text", showlegend=False))
     fig.update_layout(
-        height=int(rows * cell + 80), margin=dict(l=26, r=8, t=26, b=6), dragmode="select",
+height=int(rows * cell + 80), margin=dict(l=26, r=8, t=26, b=6),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family=FONT, color=MUTED, size=12),
         hoverlabel=dict(bgcolor="white", bordercolor=TRAY_EDGE, font=dict(family=FONT, color=INK, size=12)),
         xaxis=dict(range=[0, cols], side="top", showgrid=False, zeroline=False, showline=False, ticks="",
@@ -888,7 +911,25 @@ def layout_plate_figure(meta, wells, layout, names, active):
                    ticks="", fixedrange=True, constrain="domain",
                    tickvals=[] if meta["numbered"] else [i + 0.5 for i in range(rows)],
                    ticktext=[] if meta["numbered"] else [chr(65 + i) for i in range(rows)]))
+    if not click_mode:
+        # drag mode: a plain rectangle (never a full-height strip)
+        fig.update_layout(dragmode="select", selectdirection="d")
     return fig
+
+
+def _point_poly_dist(px, py, xs, ys):
+    """0 if the point is inside the polygon, else its distance to the polygon outline."""
+    n = len(xs)
+    inside = False
+    best = float("inf")
+    for k in range(n):
+        x1, y1, x2, y2 = xs[k], ys[k], xs[(k + 1) % n], ys[(k + 1) % n]
+        if (y1 > py) != (y2 > py) and px < (x2 - x1) * (py - y1) / ((y2 - y1) or 1e-12) + x1:
+            inside = not inside
+        dx, dy = x2 - x1, y2 - y1
+        t = 0.0 if dx == dy == 0 else max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+        best = min(best, ((px - (x1 + t * dx)) ** 2 + (py - (y1 + t * dy)) ** 2) ** 0.5)
+    return 0.0 if inside else best
 
 
 def _wells_from_event(event, wells, meta, tol=0.15):
@@ -908,6 +949,21 @@ def _wells_from_event(event, wells, meta, tol=0.15):
             i, j = _well_pos(w, meta)
             cx, cy = j + 0.5, i + 0.5
             if x0 - tol <= cx <= x1 + tol and y0 - tol <= cy <= y1 + tol:
+                picked.add(w)
+    try:
+        lassos = event["selection"]["lasso"]
+    except Exception:  # noqa: BLE001
+        lassos = []
+    for ls in lassos or []:
+        try:
+            xs, ys = [float(v) for v in ls["x"]], [float(v) for v in ls["y"]]
+        except Exception:  # noqa: BLE001
+            continue
+        if len(xs) < 2:
+            continue
+        for w in wells:
+            i, j = _well_pos(w, meta)
+            if _point_poly_dist(j + 0.5, i + 0.5, xs, ys) <= tol:
                 picked.add(w)
     return [w for w in wells if w in picked]
 
@@ -1048,18 +1104,70 @@ def _plate_legend(names, nf, active):
     st.markdown(f"<div style='font-size:.85rem'>{''.join(rows)}{note}</div>", unsafe_allow_html=True)
 
 
+SHAPES = {"Just the wells": "Wells", "Whole rows": "Rows", "Whole columns": "Columns"}
+
+
+def _plate_key():
+    ss = st.session_state
+    code = "c" if ss.get("an_selby", "Drag a box") == "Click wells" else "d"
+    return f"an_plate_{ss['an_ver']}_{ss['an_gen']}_{code}"
+
+
+def _apply_pending_paint(wells, meta):
+    """Apply the last plate selection before anything is drawn, so a paint costs one pass and no flicker."""
+    ss = st.session_state
+    if ss.get("an_view", "Plate") != "Plate":
+        return
+    state = ss.get(_plate_key())
+    if not state:
+        return
+    shape = SHAPES.get(ss.get("an_shape3", "Just the wells"), "Wells")
+    sel = _expand_shape(_wells_from_event(state, wells, meta), shape, wells, meta)
+    if not sel:
+        return
+    layout = ss["an_layout"]
+    if ss.get("an_mode", "Paint conditions") == "Exclude wells":
+        _push_undo()
+        layout.loc[sel, "Excluded"] = ss.get("an_exclact", "Exclude") == "Exclude"
+        _bump()
+    elif ss.get("an_brush"):
+        _push_undo()
+        fi, lv = ss["an_brush"]
+        layout.loc[sel, f"f{fi}"] = "" if lv == ERASE else lv
+        _bump()
+
+
+def _plate_legend(names, nf, active):
+    dot = ("<span style='display:inline-flex;align-items:center;gap:.3rem;margin-right:.8rem'>"
+           "<span style='width:12px;height:12px;border-radius:50%;background:{c};display:inline-block'></span>{t}</span>")
+    rows = []
+    for fi in active:
+        chips = "".join(dot.format(c=_color(fi, x), t=x) for x in _ordered_levels(fi))
+        rows.append(f"<div style='margin-bottom:.25rem'><b>{names[fi]}</b> &nbsp; {chips}</div>")
+    rows.append(dot.format(c="#F3F4F6;border:1px solid #9CA3AF", t="Unassigned")
+                + "<span style='display:inline-flex;align-items:center;gap:.3rem'>"
+                  "<span style='font-weight:700'>&#10005;</span> Excluded</span>")
+    note = ""
+    if len(active) > 1:
+        note = (f"<div style='color:{MUTED};margin-top:.3rem'>Each well is split into one wedge per condition, "
+                f"clockwise from the top: {', '.join(names[i] for i in active)}.</div>")
+    st.markdown(f"<div style='font-size:.85rem'>{''.join(rows)}{note}</div>", unsafe_allow_html=True)
+
+
 def _plate_panel(wells, meta, names, nf):
     ss = st.session_state
     layout = ss["an_layout"]
-    m1, m2 = st.columns([1.25, 1.6])
+    m1, m2 = st.columns([1.25, 1.25])
     m1.caption("Mode")
     with m1:
         mode = _seg("Mode", ["Paint conditions", "Exclude wells"], "an_mode", label_visibility="collapsed")
-    m2.caption("When you drag, select")
+    m2.caption("Select by")
     with m2:
-        shape_label = _seg("Drag selects", ["Wells", "Whole rows", "Whole columns"], "an_shape2",
-                           label_visibility="collapsed")
-    shape = {"Wells": "Wells", "Whole rows": "Rows", "Whole columns": "Columns"}[shape_label]
+        selby = _seg("Select by", ["Drag a box", "Click wells"], "an_selby", label_visibility="collapsed")
+    st.caption("Each selection covers")
+    shape_label = _seg("Each selection covers", list(SHAPES), "an_shape3", label_visibility="collapsed")
+    click_mode = selby == "Click wells"
+    verb = "Click" if click_mode else "Drag over"
     brush = ss.get("an_brush")
     exclude_mode = mode == "Exclude wells"
     action = "Exclude"
@@ -1067,7 +1175,7 @@ def _plate_panel(wells, meta, names, nf):
         action = _seg("Action", ["Exclude", "Restore"], "an_exclact", label_visibility="collapsed")
         st.markdown(
             f"<div style='background:rgba(255,193,7,.16);border-radius:8px;padding:8px 12px;font-size:.9rem'>"
-            f"Drag over wells to {action.lower()} them. Excluded wells keep their conditions and are left out of "
+            f"{verb} wells to {action.lower()} them. Excluded wells keep their conditions and are left out of "
             f"every chart and table.</div>", unsafe_allow_html=True)
     elif brush:
         fi, lv = brush
@@ -1077,11 +1185,11 @@ def _plate_panel(wells, meta, names, nf):
             f"<div style='display:flex;align-items:center;gap:.6rem;background:rgba(0,114,178,.08);border-radius:8px;"
             f"padding:8px 12px;font-size:.95rem'><span style='width:14px;height:14px;border-radius:50%;"
             f"background:{dot};display:inline-block'></span><b>{label}</b>"
-            f"<span style='color:{MUTED}'>Drag or click wells to paint. Click the level again to stop.</span></div>",
+            f"<span style='color:{MUTED}'>{verb} wells to paint. Click the level again to stop.</span></div>",
             unsafe_allow_html=True)
     else:
         st.markdown(f"<div style='background:rgba(128,128,128,.10);border-radius:8px;padding:8px 12px;"
-                    f"font-size:.95rem;color:{MUTED}'>Click a level on the left, then drag over wells to paint "
+                    f"font-size:.95rem;color:{MUTED}'>Click a level on the left, then {verb.lower()} wells to paint "
                     f"them.</div>", unsafe_allow_html=True)
 
     if ss.get("an_view", "Plate") == "Table":
@@ -1102,25 +1210,13 @@ def _plate_panel(wells, meta, names, nf):
         return
 
     active = _active_conditions(nf)
-    sel_key = f"an_plate_{ss['an_ver']}_{ss['an_gen']}"
-    event = st.plotly_chart(layout_plate_figure(meta, wells, layout, names[:nf], active), key=sel_key,
-                            on_select="rerun", selection_mode=("points", "box", "lasso"),
-                            config={"displayModeBar": False})
-    sel = _expand_shape(_wells_from_event(event, wells, meta), shape, wells, meta)
-    if sel:
-        if exclude_mode:
-            _push_undo()
-            layout.loc[sel, "Excluded"] = action == "Exclude"
-            _bump()
-            st.rerun(scope="fragment")
-        elif brush:
-            _push_undo()
-            fi, lv = brush
-            layout.loc[sel, f"f{fi}"] = "" if lv == ERASE else lv
-            _bump()
-            st.rerun(scope="fragment")
-        else:
-            st.caption(f"{len(sel)} well(s) selected. Click a level on the left to paint them.")
+    event = st.plotly_chart(
+        layout_plate_figure(meta, wells, layout, names[:nf], active, click_mode), key=_plate_key(),
+        on_select="rerun", selection_mode=("points",) if click_mode else ("points", "box", "lasso"),
+        config={"displayModeBar": False})
+    pending = _wells_from_event(event, wells, meta)
+    if pending and not exclude_mode and not brush:
+        st.caption(f"{len(pending)} well(s) selected. Click a level on the left to paint them.")
 
     _plate_legend(names, nf, active)
     excl = list(layout.index[layout["Excluded"]])
@@ -1466,6 +1562,7 @@ def analysis_panel(raw, df, meta, base):
     hours = df.groupby("T_index")["Elapsed_h"].first().to_numpy()
     hide = ss.get("an_hide", False)
     if not hide:
+        _apply_pending_paint(wells, meta)
         _toolbar(wells, base)
         names, nf = _clean_names(ss["an_names"]), ss["an_nf"]
         left, right = st.columns([1, 1.5], gap="large")
