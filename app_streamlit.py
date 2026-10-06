@@ -849,13 +849,27 @@ def _arc(cx, cy, r, a0, a1, n=26):
     return cx + r * np.cos(th), cy + r * np.sin(th)
 
 
+def _rounded_rect_xy(x0, y0, x1, y1, rad, n=10):
+    pts_x, pts_y = [], []
+    for ccx, ccy, a0, a1 in [(x1 - rad, y0 + rad, -90, 0), (x1 - rad, y1 - rad, 0, 90),
+                             (x0 + rad, y1 - rad, 90, 180), (x0 + rad, y0 + rad, 180, 270)]:
+        th = np.radians(np.linspace(a0, a1, n))
+        pts_x.append(ccx + rad * np.cos(th))
+        pts_y.append(ccy + rad * np.sin(th))
+    x, y = np.concatenate(pts_x), np.concatenate(pts_y)
+    return np.append(x, x[0]), np.append(y, y[0])
+
+
 def layout_plate_figure(meta, wells, layout, names, active, click_mode=False):
-    """Each well is split into one wedge per active condition (clockwise from the top)."""
+    """Plate editor figure: a gray tray like the other tabs, each well split into one wedge per active condition
+    (clockwise from the top), and clickable row letters and column numbers."""
     rows, cols = meta["rows"], meta["cols"]
+    numbered = meta["numbered"]
     cap = 110.0 if cols <= 4 else 80.0 if cols <= 6 else 64.0
     cell = min(cap, 600.0 / cols)
     size = cell * 0.84
     r, n = 0.42, len(active)
+    lpad, tpad = (0.1, 0.1) if numbered else (0.6, 0.6)
     groups, ring_x, ring_y, cross_x, cross_y = {}, [], [], [], []
     hx, hy, hov, tag_x, tag_y, tag_t = [], [], [], [], [], []
     for w in wells:
@@ -880,13 +894,16 @@ def layout_plate_figure(meta, wells, layout, names, active, click_mode=False):
         hx.append(cx); hy.append(cy)
         hov.append(f"<b>Well {w}</b>" + "".join(f"<br>{names[k]}: {row[f'f{k}'] or '-'}" for k in range(len(names)))
                    + ("<br><b>Excluded from analysis</b>" if excl else ""))
-        if meta["numbered"]:
+        if numbered:
             tag_x.append(cx - r * 0.85); tag_y.append(cy - r * 0.85); tag_t.append(w)
     fig = go.Figure()
+    tx, ty = _rounded_rect_xy(0, 0, cols, rows, 0.28)
+    fig.add_trace(go.Scatter(x=tx, y=ty, mode="lines", fill="toself", fillcolor=TRAY,
+                             line=dict(color=TRAY_EDGE, width=1.5), hoverinfo="skip", showlegend=False))
     for color, (xs, ys) in groups.items():
         fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", fill="toself", fillcolor=color,
                                  line=dict(color="white", width=1.2), hoverinfo="skip", showlegend=False))
-    fig.add_trace(go.Scatter(x=ring_x, y=ring_y, mode="lines", line=dict(color="#6B7280", width=1),
+    fig.add_trace(go.Scatter(x=ring_x, y=ring_y, mode="lines", line=dict(color="rgba(17,24,39,.35)", width=1.2),
                              hoverinfo="skip", showlegend=False))
     if cross_x:
         fig.add_trace(go.Scatter(x=cross_x, y=cross_y, mode="lines", line=dict(color="#111827", width=2.4),
@@ -894,25 +911,32 @@ def layout_plate_figure(meta, wells, layout, names, active, click_mode=False):
     if tag_t:
         fig.add_trace(go.Scatter(x=tag_x, y=tag_y, mode="text", text=tag_t, textfont=dict(size=11, color=MUTED),
                                  hoverinfo="skip", showlegend=False))
-    # transparent markers on top: they receive the drag selection and hover
+    if not numbered:
+        lab_x = [-0.3] * rows + [j + 0.5 for j in range(cols)]
+        lab_y = [i + 0.5 for i in range(rows)] + [-0.3] * cols
+        lab_t = [chr(65 + i) for i in range(rows)] + [str(j + 1) for j in range(cols)]
+        fig.add_trace(go.Scatter(x=lab_x, y=lab_y, mode="text", text=lab_t, textfont=dict(size=13, color=MUTED),
+                                 hoverinfo="skip", showlegend=False))
+        for i in range(rows):
+            hx.append(-0.3); hy.append(i + 0.5); hov.append(f"Select row {chr(65 + i)}")
+        for j in range(cols):
+            hx.append(j + 0.5); hy.append(-0.3); hov.append(f"Select column {j + 1}")
+    nw = len(wells)
+    sizes = [size] * nw + [size * 0.55] * (len(hx) - nw)
+    # transparent markers on top: they receive the drag or click selection and the hover
     fig.add_trace(go.Scatter(
-        x=hx, y=hy, mode="markers", marker=dict(size=size, color="rgba(0,0,0,0)"),
+        x=hx, y=hy, mode="markers", marker=dict(size=sizes, color="rgba(0,0,0,0)"),
         selected=dict(marker=dict(color="rgba(17,24,39,0.22)", opacity=1)),
         unselected=dict(marker=dict(opacity=1)), hovertext=hov, hoverinfo="text", showlegend=False))
+    axis = dict(showgrid=False, zeroline=False, showline=False, ticks="", showticklabels=False, fixedrange=True,
+                constrain="domain")
     fig.update_layout(
-height=int(rows * cell + 80), margin=dict(l=26, r=8, t=26, b=6),
+        height=int((rows + tpad + 0.1) * cell + 24), margin=dict(l=4, r=4, t=4, b=4),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(family=FONT, color=MUTED, size=12),
         hoverlabel=dict(bgcolor="white", bordercolor=TRAY_EDGE, font=dict(family=FONT, color=INK, size=12)),
-        xaxis=dict(range=[0, cols], side="top", showgrid=False, zeroline=False, showline=False, ticks="",
-                   fixedrange=True, constrain="domain",
-                   tickvals=[] if meta["numbered"] else [j + 0.5 for j in range(cols)],
-                   ticktext=[] if meta["numbered"] else [str(j + 1) for j in range(cols)]),
-        yaxis=dict(range=[rows, 0], scaleanchor="x", scaleratio=1, showgrid=False, zeroline=False, showline=False,
-                   ticks="", fixedrange=True, constrain="domain",
-                   tickvals=[] if meta["numbered"] else [i + 0.5 for i in range(rows)],
-                   ticktext=[] if meta["numbered"] else [chr(65 + i) for i in range(rows)]))
+        xaxis=dict(range=[-lpad, cols + 0.1], **axis),
+        yaxis=dict(range=[rows + 0.1, -tpad], scaleanchor="x", scaleratio=1, **axis))
     if not click_mode:
-        # drag mode: a plain rectangle (never a full-height strip)
         fig.update_layout(dragmode="select", selectdirection="d")
     return fig
 
@@ -932,9 +956,27 @@ def _point_poly_dist(px, py, xs, ys):
     return 0.0 if inside else best
 
 
+def _hit_items(wells, meta):
+    """Everything on the plate that can be selected, in the same order as the figure's hit markers."""
+    items = []
+    for w in wells:
+        i, j = _well_pos(w, meta)
+        items.append(("w", w, j + 0.5, i + 0.5))
+    if not meta["numbered"]:
+        items += [("r", i, -0.3, i + 0.5) for i in range(meta["rows"])]
+        items += [("c", j, j + 0.5, -0.3) for j in range(meta["cols"])]
+    return items
+
+
 def _wells_from_event(event, wells, meta, tol=0.15):
-    """Wells chosen by a drag. A box counts a well once it reaches within `tol` of the well's centre."""
-    picked = set(_selected_wells(event, wells))
+    """Wells chosen by a click or drag. A box counts an item once it reaches within `tol` of its centre, and a
+    chosen row letter or column number selects its whole row or column."""
+    items = _hit_items(wells, meta)
+    picked = set()
+    try:
+        picked |= {k for k in event["selection"]["point_indices"] if 0 <= k < len(items)}
+    except Exception:  # noqa: BLE001
+        pass
     try:
         boxes = event["selection"]["box"]
     except Exception:  # noqa: BLE001
@@ -945,11 +987,9 @@ def _wells_from_event(event, wells, meta, tol=0.15):
             y0, y1 = sorted(float(v) for v in bx["y"])
         except Exception:  # noqa: BLE001
             continue
-        for w in wells:
-            i, j = _well_pos(w, meta)
-            cx, cy = j + 0.5, i + 0.5
+        for k, (_, _, cx, cy) in enumerate(items):
             if x0 - tol <= cx <= x1 + tol and y0 - tol <= cy <= y1 + tol:
-                picked.add(w)
+                picked.add(k)
     try:
         lassos = event["selection"]["lasso"]
     except Exception:  # noqa: BLE001
@@ -961,11 +1001,18 @@ def _wells_from_event(event, wells, meta, tol=0.15):
             continue
         if len(xs) < 2:
             continue
-        for w in wells:
-            i, j = _well_pos(w, meta)
-            if _point_poly_dist(j + 0.5, i + 0.5, xs, ys) <= tol:
-                picked.add(w)
-    return [w for w in wells if w in picked]
+        for k, (_, _, cx, cy) in enumerate(items):
+            if _point_poly_dist(cx, cy, xs, ys) <= tol:
+                picked.add(k)
+    rows_sel = {items[k][1] for k in picked if items[k][0] == "r"}
+    cols_sel = {items[k][1] for k in picked if items[k][0] == "c"}
+    wells_sel = {items[k][1] for k in picked if items[k][0] == "w"}
+    out = []
+    for w in wells:
+        i, j = _well_pos(w, meta)
+        if w in wells_sel or i in rows_sel or j in cols_sel:
+            out.append(w)
+    return out
 
 
 def _clear_condition(fi):
@@ -975,24 +1022,27 @@ def _clear_condition(fi):
     _bump()
 
 
-def _expand_shape(sel, shape, wells, meta):
-    if shape == "Wells" or not sel:
-        return sel
-    pos = {w: _well_pos(w, meta) for w in wells}
-    axis = 0 if shape == "Rows" else 1
-    keep = {pos[w][axis] for w in sel}
-    return [w for w in wells if pos[w][axis] in keep]
-
-
 # ---------------------------------------------------------------- setup UI
-def _toolbar(wells, base):
+def _box_title(text):
+    st.markdown(f"<div style='font-size:1.15rem;font-weight:700;margin:0 0 .2rem'>{text}</div>",
+                unsafe_allow_html=True)
+
+
+def _status_text(wells, nf):
+    lay = st.session_state["an_layout"]
+    assigned = int((lay[[f"f{i}" for i in range(nf)]] != "").any(axis=1).sum())
+    excl = int(lay["Excluded"].sum())
+    text = f"{nf} condition{'s' if nf != 1 else ''}, {assigned} of {len(wells)} wells assigned"
+    return text + (f", {excl} excluded" if excl else "")
+
+
+def _setup_header(wells, base, hide):
     ss = st.session_state
-    c = st.columns([1.5, 0.9, 1.1, 1.2, 1.2, 1.2], vertical_alignment="center")
-    with c[0]:
-        _seg("Edit view", ["Plate", "Table"], "an_view", label_visibility="collapsed")
-    c[1].button("Undo", on_click=_undo, disabled=not ss["an_undo"], key="an_undo_btn", icon=":material/undo:")
-    c[2].button("Clear plate", on_click=_clear_plate, key="an_clear_btn")
-    with c[4].popover("Load layout", icon=":material/upload:"):
+    h = st.columns([3.2, 1.3, 1.3, 1.6], vertical_alignment="center", gap="small")
+    with h[0]:
+        _box_title("Plate setup")
+        status = st.empty()
+    with h[1].popover("Load layout", icon=":material/upload:"):
         st.caption("A layout CSV saved from this tab. Also works as a template: save, fill in the columns, load it back.")
         up = st.file_uploader("Layout CSV", type=["csv"], key="an_up", label_visibility="collapsed")
         if up is not None:
@@ -1022,8 +1072,11 @@ def _toolbar(wells, base):
                 st.success("Layout loaded.")
                 for m in msgs:
                     st.warning(m)
-    c[5].download_button("Save layout", layout_to_csv(ss["an_layout"], _clean_names(ss["an_names"]), ss["an_nf"], wells),
+    h[2].download_button("Save layout", layout_to_csv(ss["an_layout"], _clean_names(ss["an_names"]), ss["an_nf"], wells),
                          f"{base}_layout.csv", "text/csv", key="an_dl_layout", icon=":material/download:")
+    h[3].button("Show setup" if hide else "Collapse setup", on_click=_toggle_hide, key="an_hide_btn",
+                icon=":material/expand_more:" if hide else ":material/expand_less:")
+    status.caption(_status_text(wells, ss["an_nf"]))
 
 
 def _condition_card(fi, names):
@@ -1104,9 +1157,6 @@ def _plate_legend(names, nf, active):
     st.markdown(f"<div style='font-size:.85rem'>{''.join(rows)}{note}</div>", unsafe_allow_html=True)
 
 
-SHAPES = {"Just the wells": "Wells", "Whole rows": "Rows", "Whole columns": "Columns"}
-
-
 def _plate_key():
     ss = st.session_state
     code = "c" if ss.get("an_selby", "Drag a box") == "Click wells" else "d"
@@ -1121,12 +1171,11 @@ def _apply_pending_paint(wells, meta):
     state = ss.get(_plate_key())
     if not state:
         return
-    shape = SHAPES.get(ss.get("an_shape3", "Just the wells"), "Wells")
-    sel = _expand_shape(_wells_from_event(state, wells, meta), shape, wells, meta)
+    sel = _wells_from_event(state, wells, meta)
     if not sel:
         return
     layout = ss["an_layout"]
-    if ss.get("an_mode", "Paint conditions") == "Exclude wells":
+    if ss.get("an_mode2", "Paint") == "Exclude":
         _push_undo()
         layout.loc[sel, "Excluded"] = ss.get("an_exclact", "Exclude") == "Exclude"
         _bump()
@@ -1157,19 +1206,20 @@ def _plate_legend(names, nf, active):
 def _plate_panel(wells, meta, names, nf):
     ss = st.session_state
     layout = ss["an_layout"]
-    m1, m2 = st.columns([1.25, 1.25])
-    m1.caption("Mode")
-    with m1:
-        mode = _seg("Mode", ["Paint conditions", "Exclude wells"], "an_mode", label_visibility="collapsed")
-    m2.caption("Select by")
-    with m2:
+    top = st.columns([2.2, 1, 1.4], vertical_alignment="center", gap="small")
+    with top[0]:
+        _seg("Edit view", ["Plate", "Table"], "an_view", label_visibility="collapsed")
+    top[1].button("Undo", on_click=_undo, disabled=not ss["an_undo"], key="an_undo_btn", icon=":material/undo:")
+    top[2].button("Clear plate", on_click=_clear_plate, key="an_clear_btn")
+    sec = st.columns(2, gap="small")
+    with sec[0]:
+        mode = _seg("Mode", ["Paint", "Exclude"], "an_mode2", label_visibility="collapsed")
+    with sec[1]:
         selby = _seg("Select by", ["Drag a box", "Click wells"], "an_selby", label_visibility="collapsed")
-    st.caption("Each selection covers")
-    shape_label = _seg("Each selection covers", list(SHAPES), "an_shape3", label_visibility="collapsed")
     click_mode = selby == "Click wells"
     verb = "Click" if click_mode else "Drag over"
     brush = ss.get("an_brush")
-    exclude_mode = mode == "Exclude wells"
+    exclude_mode = mode == "Exclude"
     action = "Exclude"
     if exclude_mode:
         action = _seg("Action", ["Exclude", "Restore"], "an_exclact", label_visibility="collapsed")
@@ -1217,26 +1267,13 @@ def _plate_panel(wells, meta, names, nf):
     pending = _wells_from_event(event, wells, meta)
     if pending and not exclude_mode and not brush:
         st.caption(f"{len(pending)} well(s) selected. Click a level on the left to paint them.")
+    if not meta["numbered"]:
+        st.caption("Tip: click a row letter or column number to select the whole row or column.")
 
     _plate_legend(names, nf, active)
     excl = list(layout.index[layout["Excluded"]])
     if excl:
         st.caption(f"{len(excl)} excluded: {', '.join(excl[:12])}{'...' if len(excl) > 12 else ''}")
-
-
-def _summary_bar(wells, nf, hide):
-    ss = st.session_state
-    lay = ss["an_layout"]
-    assigned = int((lay[[f"f{i}" for i in range(nf)]] != "").any(axis=1).sum())
-    excl = int(lay["Excluded"].sum())
-    text = f"**Plate setup:** {nf} condition{'s' if nf != 1 else ''}, {assigned} of {len(wells)} wells assigned"
-    if excl:
-        text += f", {excl} excluded"
-    with st.container(border=True):
-        a, b = st.columns([4, 1.2], vertical_alignment="center")
-        a.markdown(text)
-        b.button("Show setup" if hide else "Collapse setup", on_click=_toggle_hide, key="an_hide_btn",
-                 icon=":material/expand_more:" if hide else ":material/expand_less:")
 
 
 def _clean_names(names):
@@ -1415,141 +1452,136 @@ def curve_figure(ts, x_levels, c_levels, x_color, c_color, err, ytitle, now_h, h
     return fig
 
 
-def _analysis_panel_body(raw, df, meta, base, names, nf, n_t, hours):
-    """Right side: choose the analysis, then charts, table and downloads."""
+def _analysis_section(raw, df, meta, base, names, nf, n_t, hours):
+    """The Analysis box: choices and exports in a left sidebar, charts and table on the right."""
     ss = st.session_state
     layout = ss["an_layout"]
-    used = [i for i in range(nf) if (layout[f"f{i}"] != "").any()]
-    if not used:
-        st.info("Name your conditions and assign wells on the left. Charts appear here as soon as at least "
-                "one condition has levels.")
-        st.markdown("**How it works**  \n1. Name up to 5 conditions, for example cell type or media, and add their "
-                    "levels.  \n2. Click a level, then drag over wells on the plate to paint them. Use Undo if you "
-                    "slip. You can also paste into the table view or load a saved layout.  \n"
-                    "3. Pick what to compare and read the charts.")
-        return
+    with st.container(border=True):
+        _box_title("Analysis")
+        used = [i for i in range(nf) if (layout[f"f{i}"] != "").any()]
+        if not used:
+            st.info("Name your conditions and assign wells in Plate setup. Charts appear here as soon as at least "
+                    "one condition has levels.")
+            st.markdown("**How it works**  \n1. Name up to 5 conditions, for example cell type or media, and add "
+                        "their levels.  \n2. Click a level, then drag over wells on the plate to paint them. Use "
+                        "Undo if you slip. You can also paste into the table view or load a saved layout.  \n"
+                        "3. Pick what to compare and read the charts.")
+            return
+        left, right = st.columns([1, 2.7], gap="large")
+        with left:
+            measure = st.selectbox("Measure", ["Scratch closure", "Confluency"], key="an_measure")
+            multi = [i for i in used if layout.loc[layout[f"f{i}"] != "", f"f{i}"].nunique() >= 2]
+            x_default = (multi or used)[0]
+            xi = st.selectbox("Compare (x-axis)", used, index=used.index(x_default), format_func=lambda i: names[i],
+                              key=f"an_x_{hash((tuple(used), tuple(multi)))}")
+            copts = ["None"] + [i for i in used if i != xi]
+            cv = st.selectbox("Color by", copts, format_func=lambda i: "None" if i == "None" else names[i],
+                              key=f"an_c_{hash(tuple(copts))}")
+            ci = None if cv == "None" else cv
+            err_name = _seg("Error bars", ["SD", "SEM"], "an_err2")
+            err = "sd" if err_name == "SD" else "sem"
+            ctrl = ss["an_ctrl"].get(xi)
+            normalize = st.checkbox("Normalize to control", value=False, key="an_norm", disabled=not ctrl,
+                                    help="Divides each value by the control level's mean (same color group, same "
+                                         "time) and shows % of control. Star a control level in the condition card.")
+            if not ctrl:
+                st.caption(f"Star a control level for {names[xi]} in Plate setup to enable this.")
+            normalize = bool(normalize and ctrl)
+            closure = measure == "Scratch closure"
+            if closure:
+                full = st.number_input("Fully closed at (% confluency)", min_value=1.0, max_value=100.0, value=95.0,
+                                       step=1.0, key="an_full")
+                cap = st.checkbox("Cap closure at 0 to 100%", value=True, key="an_cap")
+            else:
+                full, cap = 95.0, True
 
-    r1 = st.columns([1.5, 1.2, 1.2, 1, 1.3])
-    measure = r1[0].selectbox("Measure", ["Scratch closure", "Confluency"], key="an_measure")
-    multi = [i for i in used if layout.loc[layout[f"f{i}"] != "", f"f{i}"].nunique() >= 2]
-    x_default = (multi or used)[0]
-    xi = r1[1].selectbox("Compare (x-axis)", used, index=used.index(x_default), format_func=lambda i: names[i],
-                         key=f"an_x_{hash((tuple(used), tuple(multi)))}")
-    copts = ["None"] + [i for i in used if i != xi]
-    cv = r1[2].selectbox("Color by", copts, format_func=lambda i: "None" if i == "None" else names[i],
-                         key=f"an_c_{hash(tuple(copts))}")
-    ci = None if cv == "None" else cv
-    err_name = r1[3].selectbox("Error bars", ["SD", "SEM"], key="an_err")
-    err = "sd" if err_name == "SD" else "sem"
-    ctrl = ss["an_ctrl"].get(xi)
-    normalize = r1[4].checkbox("Normalize to control", value=False, key="an_norm", disabled=not ctrl,
-                               help="Divides each value by the control level's mean (same color group, same time) "
-                                    "and shows % of control. Star a control level in the condition card.")
-    if not ctrl:
-        r1[4].caption(f"Star a control level for {names[xi]} on the left.")
-    normalize = bool(normalize and ctrl)
+        bundle = closure_bundle(raw, float(full), bool(cap))
+        lay = layout.reset_index().rename(columns={"index": "Well"})
+        cl = bundle["cdf"].merge(lay, on="Well", how="left")
+        cl["Excluded"] = cl["Excluded"].fillna(False).astype(bool)
+        for i in range(MAX_F):
+            cl[f"f{i}"] = cl[f"f{i}"].fillna("")
+        col = "Closure_pct" if closure else "Confluency"
+        ytitle = "% of control" if normalize else ("% closure" if closure else "% confluency")
+        d_all = group_data(cl, xi, ci, col, normalize, ctrl)
+        if d_all.empty:
+            with right:
+                st.warning("No wells have a level for the chosen conditions yet.")
+            return
+        if closure:
+            t_def = default_hour(group_data(cl, xi, ci, "Closure_pct", False, None), n_t)
+        else:
+            t_def = n_t
+        sig = (measure, float(full), bool(cap), xi, ci,
+               int(pd.util.hash_pandas_object(layout, index=True).sum() % 10**9))
+        with left:
+            t = st.select_slider("Hour for the bar chart and table", options=list(range(1, n_t + 1)), value=t_def,
+                                 format_func=lambda k: f"{hours[k - 1]:.1f} h", key=f"an_hour_{hash(sig)}")
+            if closure:
+                st.caption(f"Default is the first hour any group's mean closure reaches {CLOSE_AT:g}% "
+                           f"({hours[t_def - 1]:.1f} h), or the last timepoint if none does.")
 
-    closure = measure == "Scratch closure"
-    if closure:
-        r2 = st.columns([1.3, 1.3, 3])
-        full = r2[0].number_input("Fully closed at (% confluency)", min_value=1.0, max_value=100.0, value=95.0,
-                                  step=1.0, key="an_full")
-        cap = r2[1].checkbox("Cap closure at 0 to 100%", value=True, key="an_cap")
-    else:
-        full, cap = 95.0, True
-    bundle = closure_bundle(raw, float(full), bool(cap))
-    cdf = bundle["cdf"]
-    lay = layout.reset_index().rename(columns={"index": "Well"})
-    cl = cdf.merge(lay, on="Well", how="left")
-    cl["Excluded"] = cl["Excluded"].fillna(False).astype(bool)
-    for i in range(MAX_F):
-        cl[f"f{i}"] = cl[f"f{i}"].fillna("")
+        x_levels = [x for x in _ordered_levels(xi) if x in set(d_all["X"])]
+        c_levels = [c for c in (_ordered_levels(ci) if ci is not None else [""]) if c in set(d_all["C"])]
+        x_color = {x: _color(xi, x) for x in x_levels}
+        c_color = {c: _color(ci, c) for c in c_levels} if ci is not None else {}
+        cname = names[ci] if ci is not None else ""
+        s_t = d_all[d_all["T_index"] == t]
+        g = _agg(s_t, ["X", "C"])
+        if g.empty:
+            with right:
+                st.warning("No data at this hour for the chosen groups.")
+            return
+        ts = _agg(d_all, ["X", "C", "T_index", "Elapsed_h"])
 
-    col = "Closure_pct" if closure else "Confluency"
-    ytitle = ("% of control" if normalize else ("% closure" if closure else "% confluency"))
-    d_all = group_data(cl, xi, ci, col, normalize, ctrl)
-    if d_all.empty:
-        st.warning("No wells have a level for the chosen conditions yet.")
-        return
+        g["Group"] = [_group_label(x, c) for x, c in zip(g["X"], g["C"])]
+        g["xo"] = g["X"].map({x: k for k, x in enumerate(x_levels)})
+        g["co"] = g["C"].map({c: k for k, c in enumerate(c_levels)})
+        g = g.sort_values(["xo", "co"])
+        summ = g[["n", "mean", "sd", "sem"]].rename(columns={"n": "n", "mean": "Mean", "sd": "SD", "sem": "SEM"})
+        if ci is not None:
+            summ.insert(0, names[ci], g["C"].to_numpy())
+        summ.insert(0, names[xi], g["X"].to_numpy())
+        summ = summ.round({"Mean": 2, "SD": 2, "SEM": 2})
+        summ.insert(0, "Hour", round(float(hours[t - 1]), 2))
+        summ.insert(1, "Measure", ytitle)
 
-    # default hour: first time any group reaches full closure
-    if closure:
-        d_raw = group_data(cl, xi, ci, "Closure_pct", False, None)
-        t_def = default_hour(d_raw, n_t)
-    else:
-        t_def = n_t
-    sig = (measure, float(full), bool(cap), xi, ci, int(pd.util.hash_pandas_object(layout, index=True).sum() % 10**9))
-    t = st.select_slider("Hour for the bar chart and table", options=list(range(1, n_t + 1)), value=t_def,
-                         format_func=lambda k: f"{hours[k - 1]:.1f} h", key=f"an_hour_{hash(sig)}")
-    if closure:
-        st.caption(f"Default is the first hour any group's mean closure reaches {CLOSE_AT:g}% "
-                   f"({hours[t_def - 1]:.1f} h), or the last timepoint if none does. Move the slider to change it.")
+        s2 = s_t.assign(Group=[_group_label(x, c) for x, c in zip(s_t["X"], s_t["C"])])
+        prism = s2.assign(Rep=s2.groupby("Group").cumcount() + 1).pivot(index="Rep", columns="Group", values="V")
+        prism = prism.reindex(columns=list(g["Group"])).reset_index()
+        prism.columns.name = None
+        long_out = cl.sort_values(["RowIdx", "ColIdx", "T_index"]).copy()
+        long_out["Time"] = long_out["ReferenceTime"].dt.strftime("%Y-%m-%d %H:%M")
+        long_out = long_out.rename(columns={f"f{i}": names[i] for i in range(nf)}).rename(
+            columns={"T_index": "Timepoint"})
+        long_out["Excluded"] = np.where(long_out["Excluded"], "yes", "")
+        keep = ["Well", "Row", "Column"] + [names[i] for i in range(nf)] + [
+            "Excluded", "Timepoint", "Time", "Elapsed_h", "Confluency", "Closure_pct"]
 
-    x_levels = [x for x in _ordered_levels(xi) if x in set(d_all["X"])]
-    c_levels = [c for c in (_ordered_levels(ci) if ci is not None else [""]) if c in set(d_all["C"])]
-    x_color = {x: _color(xi, x) for x in x_levels}
-    c_color = {c: _color(ci, c) for c in c_levels} if ci is not None else {}
-    cname = names[ci] if ci is not None else ""
-
-    s = d_all[d_all["T_index"] == t]
-    g = _agg(s, ["X", "C"])
-    if g.empty:
-        st.warning("No data at this hour for the chosen groups.")
-        return
-
-    st.markdown(f"**{measure} by {names[xi]}" + (f" and {names[ci]}" if ci is not None else "")
-                + f" at {hours[t - 1]:.1f} h**")
-    st.plotly_chart(bar_figure(s, g, x_levels, c_levels, x_color, c_color, err, ytitle, cname, ci is not None),
-                    config=AN_CONFIG, key="an_bar")
-    if (g["n"] == 1).any():
-        st.caption("Some groups have a single well, so they have no error bars.")
-
-    ts = _agg(d_all, ["X", "C", "T_index", "Elapsed_h"])
-    st.markdown("**Over time**")
-    st.plotly_chart(curve_figure(ts, x_levels, c_levels, x_color, c_color, err, ytitle, hours[t - 1], ci is not None),
-                    config=AN_CONFIG, key="an_curve")
-
-    # summary table and downloads
-    g["Group"] = [_group_label(x, c) for x, c in zip(g["X"], g["C"])]
-    g["xo"] = g["X"].map({x: k for k, x in enumerate(x_levels)})
-    g["co"] = g["C"].map({c: k for k, c in enumerate(c_levels)})
-    g = g.sort_values(["xo", "co"])
-    cols = {"Group": "Group", "n": "n", "mean": "Mean", "sd": "SD", "sem": "SEM"}
-    summ = g[list(cols)].rename(columns=cols)
-    if ci is not None:
-        summ.insert(1, names[ci], g["C"].to_numpy())
-        summ.insert(1, names[xi], g["X"].to_numpy())
-        summ = summ.drop(columns="Group")
-    else:
-        summ.insert(1, names[xi], g["X"].to_numpy())
-        summ = summ.drop(columns="Group")
-    summ = summ.round({"Mean": 2, "SD": 2, "SEM": 2})
-    summ.insert(0, "Hour", round(float(hours[t - 1]), 2))
-    summ.insert(1, "Measure", ytitle)
-    st.markdown("**Summary**")
-    st.dataframe(summ, hide_index=True)
-
-    s2 = s.assign(Group=[_group_label(x, c) for x, c in zip(s["X"], s["C"])])
-    order = list(g["Group"])
-    prism = s2.assign(Rep=s2.groupby("Group").cumcount() + 1).pivot(index="Rep", columns="Group", values="V")
-    prism = prism.reindex(columns=order).reset_index()
-    prism.columns.name = None
-
-    long_out = cl.sort_values(["RowIdx", "ColIdx", "T_index"]).copy()
-    long_out["Time"] = long_out["ReferenceTime"].dt.strftime("%Y-%m-%d %H:%M")
-    long_out = long_out.rename(columns={f"f{i}": names[i] for i in range(nf)}).rename(columns={"T_index": "Timepoint"})
-    long_out["Excluded"] = np.where(long_out["Excluded"], "yes", "")
-    keep = ["Well", "Row", "Column"] + [names[i] for i in range(nf)] + ["Excluded", "Timepoint", "Time", "Elapsed_h",
-                                                                         "Confluency", "Closure_pct"]
-    st.markdown("**Export**")
-    e1, e2, e3, _ = st.columns([1, 1, 1.4, 1])
-    e1.download_button("Summary (CSV)", summ.to_csv(index=False).encode(), f"{base}_group_summary.csv",
-                       "text/csv", key="an_dl_sum")
-    e2.download_button("Prism layout (CSV)", prism.to_csv(index=False).encode(), f"{base}_group_prism.csv",
-                       "text/csv", key="an_dl_prism")
-    e3.download_button("All wells with conditions (CSV)", long_out[keep].to_csv(index=False).encode(),
-                       f"{base}_wells_with_conditions.csv", "text/csv", key="an_dl_long")
-    st.caption("Prism layout has one column per group and one row per replicate, at the hour chosen above.")
+        with right:
+            st.markdown(f"**{measure} by {names[xi]}" + (f" and {names[ci]}" if ci is not None else "")
+                        + f" at {hours[t - 1]:.1f} h**")
+            st.plotly_chart(bar_figure(s_t, g, x_levels, c_levels, x_color, c_color, err, ytitle, cname,
+                                       ci is not None), config=AN_CONFIG, key="an_bar")
+            st.markdown("**Over time**")
+            st.plotly_chart(curve_figure(ts, x_levels, c_levels, x_color, c_color, err, ytitle, hours[t - 1],
+                                         ci is not None), config=AN_CONFIG, key="an_curve")
+            st.markdown("**Summary**")
+            st.dataframe(summ, hide_index=True)
+        with left:
+            single = g[g["n"] == 1]
+            if len(single):
+                labels = ", ".join(single["Group"])
+                st.warning(f"Only one well is analyzed in: {labels}. A group with one well has no error bars.")
+            st.divider()
+            st.markdown("**Export**")
+            st.download_button("Summary (CSV)", summ.to_csv(index=False).encode(), f"{base}_group_summary.csv",
+                               "text/csv", key="an_dl_sum")
+            st.download_button("Prism layout (CSV)", prism.to_csv(index=False).encode(),
+                               f"{base}_group_prism.csv", "text/csv", key="an_dl_prism")
+            st.download_button("All wells with conditions (CSV)", long_out[keep].to_csv(index=False).encode(),
+                               f"{base}_wells_with_conditions.csv", "text/csv", key="an_dl_long")
+            st.caption("Prism layout has one column per group and one row per replicate, at the hour chosen above.")
 
 
 @st.fragment
@@ -1563,29 +1595,37 @@ def analysis_panel(raw, df, meta, base):
     hide = ss.get("an_hide", False)
     if not hide:
         _apply_pending_paint(wells, meta)
-        _toolbar(wells, base)
-        names, nf = _clean_names(ss["an_names"]), ss["an_nf"]
-        left, right = st.columns([1, 1.5], gap="large")
-        with left:
-            _conditions_panel(names, nf)
-        with right:
-            _plate_panel(wells, meta, _clean_names(ss["an_names"]), nf)
+    with st.container(border=True):
+        _setup_header(wells, base, hide)
+        if not hide:
+            names, nf = _clean_names(ss["an_names"]), ss["an_nf"]
+            left, right = st.columns([1, 1.5], gap="large")
+            with left:
+                _conditions_panel(names, nf)
+            with right:
+                _plate_panel(wells, meta, _clean_names(ss["an_names"]), nf)
     names, nf = _clean_names(ss["an_names"]), ss["an_nf"]
-    _summary_bar(wells, nf, hide)
-    _analysis_panel_body(raw, df, meta, base, names, nf, n_t, hours)
+    _analysis_section(raw, df, meta, base, names, nf, n_t, hours)
 
 
 # ---------------------------------------------------------------- app
+DISCLAIMER = ("Independent tool for analyzing CM30 data. Not sponsored by, endorsed by, or created by "
+              "Evident Scientific.")
+
+
 def main():
     st.set_page_config(page_title="CM30 Plate Viewer", page_icon="🧫", layout="wide")
     st.markdown(TAB_CSS, unsafe_allow_html=True)
     st.title("CM30 Plate Viewer")
-    st.markdown(
-        "**Step 1:** Export and download your analysis .csv from the CM30  \n"
-        "**Step 2:** Extract the files  \n"
-        "**Step 3:** Upload the file that contains the averages per well. The filename will contain EV"
-    )
+    st.caption(DISCLAIMER)
+    steps_box = st.container()
     up = st.file_uploader("Upload CM30 .csv", type=["csv"])
+    with steps_box:
+        with st.expander("How to export from the CM30", expanded=up is None):
+            st.markdown(
+                "**Step 1:** Export and download your analysis .csv from the CM30  \n"
+                "**Step 2:** Extract the files  \n"
+                "**Step 3:** Upload the file that contains the averages per well. The filename will contain EV")
     if up is None:
         st.info("Upload a CM30 export to begin.")
         return
@@ -1601,27 +1641,31 @@ def main():
     plate_size = meta["rows"] * meta["cols"]
     values_default = plate_size <= 24
     hours = df.groupby("T_index")["Elapsed_h"].first().to_numpy()
+    st.caption(f"{plate_size}-well plate, {df['Well'].nunique()} wells with data, {n_t} timepoints over "
+               f"{hours[-1]:.0f} h")
     tab_heat, tab_scratch, tab_analysis = st.tabs(["Heatmap", "Scratch assay", "Analysis"])
 
     with tab_heat:
         left, right = st.columns([1, 3.4], gap="large")
         conf = confluency_export(raw)
         with left:
-            st.markdown("**Scale**")
-            a, b = st.columns(2)
-            vmin = a.number_input("Min %", value=0.0, step=5.0, key="h_min")
-            vmax = b.number_input("Max %", value=100.0, step=5.0, key="h_max")
-            st.markdown("**Colors**")
-            a, b = st.columns(2)
-            col0 = a.color_picker("Low color (at Min %)", "#FFFFFF", key="h_c0")
-            col1 = b.color_picker("High color (at Max %)", "#8B0000", key="h_c1")
-            st.caption("Click a swatch to pick a color.")
-            st.markdown("**Wells**")
-            show_vals = st.toggle("Show values on wells", value=values_default, key=f"h_vals_{plate_size}")
-            st.markdown("**Export**")
-            st.download_button("Confluency data (CSV)", conf["csv"], f"{base}_confluency.csv",
-                               "text/csv", key="dl_conf")
-            st.caption("One row per well and timepoint, ready for pivot tables and Prism.")
+            with st.container(border=True):
+                _box_title("Display")
+                st.caption("Scale")
+                a, b = st.columns(2)
+                vmin = a.number_input("Min %", value=0.0, step=5.0, key="h_min")
+                vmax = b.number_input("Max %", value=100.0, step=5.0, key="h_max")
+                st.caption("Colors")
+                a, b = st.columns(2)
+                col0 = a.color_picker("Low color (at Min %)", "#FFFFFF", key="h_c0")
+                col1 = b.color_picker("High color (at Max %)", "#8B0000", key="h_c1")
+                st.caption("Click a swatch to pick a color.")
+                show_vals = st.toggle("Show values on wells", value=values_default, key=f"h_vals_{plate_size}")
+            with st.container(border=True):
+                _box_title("Export")
+                st.download_button("Confluency data (CSV)", conf["csv"], f"{base}_confluency.csv",
+                                   "text/csv", key="dl_conf")
+                st.caption("One row per well and timepoint, ready for pivot tables and Prism.")
         with right:
             if vmax <= vmin:
                 st.warning("Max must be greater than min.")
@@ -1636,32 +1680,34 @@ def main():
     with tab_scratch:
         left, right = st.columns([1, 3.4], gap="large")
         with left:
-            st.markdown("**Closure**")
-            full = st.number_input("Fully closed at (% confluency)", min_value=1.0, max_value=100.0,
-                                   value=95.0, step=1.0, key="s_full",
-                                   help="Closure is 100% when a well reaches this confluency. "
-                                        "Closure = (current - start) / (this value - start).")
-            cap = st.checkbox("Cap closure at 0 to 100%", value=True, key="s_cap")
-            st.markdown("**Colors**")
-            a, b = st.columns(2)
-            c_start = a.color_picker("Starting cells color", "#94A3B8", key="s_c0")
-            c_mig = b.color_picker("Migration color", "#0F9D8A", key="s_c1")
-            st.caption("Click a swatch to pick a color.")
-            st.markdown("**Wells**")
-            show_vals = st.toggle("Show values on wells", value=values_default, key=f"s_vals_{plate_size}")
-            bundle = closure_bundle(raw, float(full), bool(cap))
-            if bundle["n_bad"]:
-                st.warning(f"{bundle['n_bad']} well(s) start at or above {full:g}% confluency, so closure can't "
-                           "be calculated for them. Raise the fully closed value if that is unexpected.")
-            st.caption("Migration bands show how far cells have moved into the scratch. The gap width is "
-                       "schematic. Time zero is the first timepoint.")
-            st.markdown("**Export**")
-            st.download_button("Closure, long (CSV)", bundle["long_csv"], f"{base}_closure_long.csv",
-                               "text/csv", key="dl_long")
-            st.download_button("Closure, wide (CSV)", bundle["wide_csv"], f"{base}_closure_wide.csv",
-                               "text/csv", key="dl_wide")
-            st.caption("Long has one row per well and timepoint, best for pivot tables and Prism. "
-                       "Wide has one column per well.")
+            with st.container(border=True):
+                _box_title("Display")
+                st.caption("Closure")
+                full = st.number_input("Fully closed at (% confluency)", min_value=1.0, max_value=100.0,
+                                       value=95.0, step=1.0, key="s_full",
+                                       help="Closure is 100% when a well reaches this confluency. "
+                                            "Closure = (current - start) / (this value - start).")
+                cap = st.checkbox("Cap closure at 0 to 100%", value=True, key="s_cap")
+                st.caption("Colors")
+                a, b = st.columns(2)
+                c_start = a.color_picker("Starting cells color", "#94A3B8", key="s_c0")
+                c_mig = b.color_picker("Migration color", "#0F9D8A", key="s_c1")
+                st.caption("Click a swatch to pick a color.")
+                show_vals = st.toggle("Show values on wells", value=values_default, key=f"s_vals_{plate_size}")
+                bundle = closure_bundle(raw, float(full), bool(cap))
+                if bundle["n_bad"]:
+                    st.warning(f"{bundle['n_bad']} well(s) start at or above {full:g}% confluency, so closure can't "
+                               "be calculated for them. Raise the fully closed value if that is unexpected.")
+                st.caption("Migration bands show how far cells have moved into the scratch. The gap width is "
+                           "schematic. Time zero is the first timepoint.")
+            with st.container(border=True):
+                _box_title("Export")
+                st.download_button("Closure, long (CSV)", bundle["long_csv"], f"{base}_closure_long.csv",
+                                   "text/csv", key="dl_long")
+                st.download_button("Closure, wide (CSV)", bundle["wide_csv"], f"{base}_closure_wide.csv",
+                                   "text/csv", key="dl_wide")
+                st.caption("Long has one row per well and timepoint, best for pivot tables and Prism. "
+                           "Wide has one column per well.")
         with right:
             mean_closure = bundle["cdf"].groupby("T_index")["Closure_pct"].mean().to_numpy()
             run_player("scratch", n_t, bundle["cdf"], meta,
